@@ -1,0 +1,6 @@
+experiment:
+  npz_path: data/processed/dataset_v0.npz
+  manifest_path: data/processed/split_manifest.json
+  use_cae: false       # Day9 게이트용 스위치
+  conf_thr: 0.5
+  output_dir: results/

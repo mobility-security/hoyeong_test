@@ -1,0 +1,6 @@
+train:
+  lr: 1.0e-3
+  batch_size: 32
+  epochs: 100
+  patience: 5
+  seeds: [0, 1, 2, 3, 4]
