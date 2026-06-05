@@ -1,0 +1,15 @@
+torch
+torchvision
+numpy
+pandas
+scikit-learn
+PyWavelets
+dpkt
+scapy
+opencv-python-headless
+matplotlib
+seaborn
+tensorboard
+omegaconf
+tqdm
+pyyaml
