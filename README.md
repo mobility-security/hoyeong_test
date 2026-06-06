@@ -281,3 +281,28 @@ cae:
 - 실제 NPZ로 교체한 뒤에는 기존 stub manifest를 재사용하지 말고 실제 데이터 기준으로 새 manifest를 생성하세요.
 - 데이터 분할은 시간적 누수 방지를 위해 `pcap_id` 기반 PCAP 블록 분할을 우선 사용하고, 메타데이터가 없을 때만 인덱스 순서 기반 fallback을 사용합니다.
 - `configs/experiment.yaml`의 `use_cae`는 CAE 검증 결과에 따라 수동으로 결정합니다. `false`이면 S2-only 모드입니다.
+
+## References
+
+이 프로젝트의 구조와 평가 방법은 다음 연구를 참고했습니다.
+
+1. M. L. Han, B. I. Kwak, and H. K. Kim, ["TOW-IDS: Intrusion Detection System Based on Three Overlapped Wavelets for Automotive Ethernet"](https://doi.org/10.1109/TIFS.2022.3221893), *IEEE Transactions on Information Forensics and Security*, 2023.
+2. L. F. Marques da Luz, P. F. de Araujo-Filho, and D. R. Campelo, ["Multi-stage Deep Learning-based Intrusion Detection System for Automotive Ethernet Networks"](https://doi.org/10.1016/j.adhoc.2024.103548), *Ad Hoc Networks*, 2024.
+3. S. Jeong, H. K. Kim, M. L. Han, and B. I. Kwak, ["AERO: Automotive Ethernet Real-Time Observer for Anomaly Detection in In-Vehicle Networks"](https://doi.org/10.1109/TII.2023.3324949), *IEEE Transactions on Industrial Informatics*, 2024.
+4. M. S. G. A. Leandro et al., ["SeqWatch: Unsupervised Sequence-based Intrusion Detection System for Automotive Ethernet"](https://doi.org/10.5753/sbrc.2025.5949), *SBRC*, 2025.
+5. F. Chollet, ["Xception: Deep Learning with Depthwise Separable Convolutions"](https://openaccess.thecvf.com/content_cvpr_2017/html/Chollet_Xception_Deep_Learning_CVPR_2017_paper.html), *CVPR*, 2017.
+6. K. He et al., ["Deep Residual Learning for Image Recognition"](https://openaccess.thecvf.com/content_cvpr_2016/html/He_Deep_Residual_Learning_CVPR_2016_paper.html), *CVPR*, 2016.
+7. P. Vincent et al., ["Extracting and Composing Robust Features with Denoising Autoencoders"](https://doi.org/10.1145/1390156.1390294), *ICML*, 2008.
+8. D. Hendrycks and K. Gimpel, ["A Baseline for Detecting Misclassified and Out-of-Distribution Examples in Neural Networks"](https://openreview.net/forum?id=Hkg4TI9xl), *ICLR*, 2017.
+
+## Contact
+
+버그 제보, 실행 문의 및 개선 제안은 [GitHub Issues](https://github.com/kwonhoyeong/automotive-ethernet-ids/issues)에 등록해 주세요.
+
+## Acknowledgements
+
+Automotive Ethernet IDS 연구 기반을 제공한 TOW-IDS 저자들과 데이터 전처리 및 평가를 함께 진행하는 프로젝트 팀원들에게 감사드립니다.
+
+## License
+
+현재 이 저장소에는 별도의 오픈소스 라이선스가 적용되어 있지 않습니다. 사용 또는 재배포가 필요한 경우 저장소 소유자에게 문의해 주세요.
