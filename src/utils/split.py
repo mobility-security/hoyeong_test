@@ -1,12 +1,11 @@
 """
-Leakage-safe train/val/test split for wavelet image datasets.
+웨이블릿 이미지 데이터셋의 시간적 누수 방지 train/val/test 분할.
 
-Wavelet images from the same PCAP share packets (sliding-window), so random
-split causes temporal leakage.  When pcap_id is available we split by PCAP
-block; otherwise we fall back to positional (index-order) split and apply a
-scaled guard gap to reduce leakage.
+같은 PCAP에서 슬라이딩 윈도우로 생성된 이미지는 패킷을 공유하므로
+랜덤 분할 시 시간적 누수가 발생함. pcap_id가 있으면 PCAP 블록 단위로 분할하고,
+없으면 인덱스 순서 기반 분할에 guard_gap을 적용해 누수를 최소화.
 
-Usage (as script):
+스크립트로 실행 시:
   python -m src.utils.split
   python -m src.utils.split --npz data/processed/dataset_v0.npz
 """
@@ -37,11 +36,11 @@ def make_split_manifest(
     seed: int = 42,
 ) -> dict:
     """
-    Build a frozen train/val/test split and save it to out_path.
-    Once generated, this file must NEVER be modified — all S1/S2/S3 models
-    share the same test_idx for a fair comparison.
+    고정된 train/val/test 분할을 생성하고 out_path에 저장.
+    한 번 생성 후 절대 수정 금지 — S1/S2/S3 모델이 동일한 test_idx를 공유해야
+    공정한 비교가 가능함.
 
-    Returns the manifest dict.
+    반환값: manifest dict
     """
     assert abs(sum(ratio) - 1.0) < 1e-6, f'ratio must sum to 1, got {sum(ratio)}'
 
@@ -124,7 +123,7 @@ def make_split_manifest(
 # ---------------------------------------------------------------------------
 
 def _split_by_pcap(y, meta, ratio, guard_gap):
-    """Temporal split by pcap_id. Applies guard_gap at PCAP block boundaries."""
+    """pcap_id 기반 시간적 분할. PCAP 블록 경계에 guard_gap 적용."""
     pcap_ids   = np.array(meta['pcap_id'])
     unique_pcaps = sorted(set(pcap_ids.tolist()))
     n = len(unique_pcaps)
@@ -158,8 +157,8 @@ def _split_by_pcap(y, meta, ratio, guard_gap):
 
 def _split_by_index(N, ratio, guard_gap):
     """
-    Fallback: positional split when pcap_id is unavailable.
-    Scales guard_gap down if the dataset is too small to fit all three regions.
+    pcap_id 없을 때 폴백: 인덱스 순서 기반 분할.
+    데이터셋이 작아 세 구간을 모두 확보할 수 없으면 guard_gap을 자동으로 축소.
     """
     n_train = int(N * ratio[0])
     n_val   = int(N * ratio[1])
@@ -192,7 +191,7 @@ def _split_by_index(N, ratio, guard_gap):
 # ---------------------------------------------------------------------------
 
 def _check_class_ratio(y, train_idx, strict: bool = True, tol: float = 0.01):
-    """Compare class proportions in train vs overall dataset."""
+    """train 분할의 클래스 비율이 전체 데이터셋과 ±1% 이내인지 검증."""
     overall = {int(c): (y == c).sum() / len(y) for c in np.unique(y)}
     train_y = y[list(train_idx)] if train_idx else np.array([], dtype=y.dtype)
 

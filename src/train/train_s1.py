@@ -1,9 +1,9 @@
 """
-Stage-1 baseline: binary DCNN (Normal vs Attack).
+Phase 1 베이스라인: 이진 분류 DCNN (Normal vs Attack).
 
-Usage:
-  python -m src.train.train_s1           # full run: 100 epochs × 5 seeds
-  python -m src.train.train_s1 --smoke   # 1 epoch, seed 0 only
+사용법:
+  python -m src.train.train_s1           # 전체 실행: 100 epoch × 5 seed
+  python -m src.train.train_s1 --smoke   # 스모크 테스트: 1 epoch, seed 0만
 """
 import argparse
 import copy
@@ -32,7 +32,7 @@ from src.utils.seed import set_seed
 # ---------------------------------------------------------------------------
 
 def binarize(y: np.ndarray) -> np.ndarray:
-    """Map multi-class labels to binary: 0=Normal, 1=Attack."""
+    """다중 클래스 레이블을 이진으로 변환: 0=Normal, 1=Attack."""
     return (y != 0).astype(np.int64)
 
 
@@ -44,7 +44,7 @@ class EarlyStopping:
         self.best_weights = None
 
     def step(self, val_loss: float, model: nn.Module) -> bool:
-        """Return True when training should stop."""
+        """학습을 중단해야 할 때 True 반환."""
         if val_loss < self.best_loss:
             self.best_loss = val_loss
             self.counter = 0
@@ -104,7 +104,7 @@ def train_one_seed(
     idx_trainval, idx_test = train_test_split(
         idx, test_size=0.2, stratify=y_bin, random_state=seed
     )
-    # val = 10% of total → 10/80 = 12.5% of trainval
+    # val = 전체의 10% → trainval 대비 10/80 = 12.5%
     idx_train, idx_val = train_test_split(
         idx_trainval,
         test_size=0.1 / 0.8,

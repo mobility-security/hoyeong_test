@@ -3,6 +3,8 @@ import torch.nn as nn
 
 
 class SeparableConv2d(nn.Module):
+    """Depthwise + Pointwise 분리 합성곱 — 파라미터 수를 줄이면서 표현력 유지."""
+
     def __init__(self, in_ch: int, out_ch: int, kernel: int, stride: int = 1, padding: int = 0):
         super().__init__()
         self.depthwise = nn.Conv2d(
@@ -16,7 +18,7 @@ class SeparableConv2d(nn.Module):
 
 
 class BlockA(nn.Module):
-    """SepConv(3→256, k=3, stride=3) → ReLU → BN → MaxPool(2,2). No skip."""
+    """특징 추출 블록: SepConv(3→256, k=3, stride=3) → ReLU → BN → MaxPool(2,2). 스킵 연결 없음."""
 
     def __init__(self):
         super().__init__()
@@ -30,7 +32,7 @@ class BlockA(nn.Module):
 
 
 class BlockB(nn.Module):
-    """SepConv(256→256, k=3, stride=1) → ReLU → BN + skip(F(x)+x). ×5"""
+    """잔차 블록: SepConv(256→256, k=3, stride=1) → ReLU → BN + 스킵 연결(F(x)+x). ×5 반복."""
 
     def __init__(self):
         super().__init__()
@@ -43,7 +45,7 @@ class BlockB(nn.Module):
 
 
 class BlockC(nn.Module):
-    """SepConv(256→512, k=3, stride=3) → GlobalAvgPool → Flatten."""
+    """채널 확장 블록: SepConv(256→512, k=3, stride=3) → 전역 평균 풀링 → Flatten."""
 
     def __init__(self):
         super().__init__()
@@ -59,8 +61,8 @@ class BlockC(nn.Module):
 
 class DCNN(nn.Module):
     """
-    TOW-IDS DCNN: Block A(×1) → Block B(×5) → Block C(×1) → FC head.
-    num_classes=2 for Phase 1 (binary), 6 for Phase 2 (multiclass).
+    TOW-IDS DCNN 백본: Block A(×1) → Block B(×5) → Block C(×1) → FC 헤드.
+    num_classes=2: Phase 1 이진 분류 / num_classes=6: Phase 2 공격 유형 분류.
     """
 
     def __init__(self, num_classes: int = 2, dropout: float = 0.5):

@@ -1,15 +1,15 @@
 """
-Two-Stage Gated Cascade Pipeline (S3).
+2단계 게이트 캐스케이드 파이프라인 (Stage 3).
 
-Stage 1 — CAE gate:
-  MSE(x) ≤ tau  →  Normal (stop)
+Stage 1 — CAE 이상 탐지 게이트:
+  MSE(x) ≤ tau  →  Normal (종료)
 
-Stage 2 — S2 classifier:
-  max_softmax_prob ≥ conf_thr  →  one of F_I / P_I / M_F / C_D / C_R
-  max_softmax_prob <  conf_thr →  Unknown
+Stage 2 — S2 공격 분류기:
+  max_softmax_prob ≥ conf_thr  →  F_I / P_I / M_F / C_D / C_R 중 하나
+  max_softmax_prob <  conf_thr →  Unknown (제로데이 의심)
 
-When use_cae=False (Day-9 FAIL gate), all inputs bypass Stage 1 and go
-directly to Stage 2 (S2-only mode). No code changes needed — flip the flag.
+use_cae=False 시 Stage 1을 건너뛰고 S2 단독 모드로 동작.
+configs/experiment.yaml의 use_cae 플래그만 바꾸면 됨 — 코드 수정 불필요.
 """
 import json
 
@@ -42,19 +42,19 @@ class TwoStagePipeline:
     @torch.no_grad()
     def predict(self, x: torch.Tensor) -> dict:
         """
-        Batch inference.
+        배치 추론.
 
-        Returns:
-          label    : List[str]   — one of 7 class names
-          stage    : List[int]   — 1 (CAE Normal) or 2 (S2 branch)
-          mse      : List[float] — per-image reconstruction error (nan if use_cae=False)
-          max_prob : List[float|None] — S2 max-softmax (None for stage-1 samples)
+        반환값:
+          label    : List[str]        — 7개 클래스명 중 하나
+          stage    : List[int]        — 1 (CAE Normal 판정) 또는 2 (S2 분류기 경유)
+          mse      : List[float]      — 이미지별 복원 오차 (use_cae=False면 nan)
+          max_prob : List[float|None] — S2 max-softmax 확률 (Stage 1 종료 샘플은 None)
         """
         self.s2.eval()
         if self.cae is not None:
             self.cae.eval()
 
-        # Stage 1: CAE MSE
+        # Stage 1: CAE 복원 오차 계산
         if self.use_cae and self.cae is not None:
             xhat = self.cae(x)
             mse  = ((xhat - x) ** 2).mean(dim=(1, 2, 3))   # (B,)
@@ -66,14 +66,14 @@ class TwoStagePipeline:
         for i in range(len(x)):
             mse_val = mse[i].item()
 
-            # Stage 1 gate
+            # Stage 1 게이트: MSE ≤ τ 이면 Normal로 조기 종료
             if self.use_cae and not np.isnan(mse_val) and mse_val <= self.tau:
                 labels.append('Normal')
                 stages.append(1)
                 max_probs.append(None)
                 continue
 
-            # Stage 2: S2 classifier
+            # Stage 2: S2 분류기 — max-softmax로 Unknown 판단
             logits = self.s2(x[i].unsqueeze(0))
             probs  = F.softmax(logits, dim=1)
             mp, pc = probs.max(dim=1)
@@ -97,8 +97,8 @@ class TwoStagePipeline:
                            device: torch.device,
                            target_fpr: float = 0.05) -> float:
         """
-        Find the smallest conf_thr such that Normal FPR ≤ target_fpr on val set.
-        Searches conf_thr ∈ [0.30, 0.90) step 0.05.
+        val 세트에서 Normal FPR ≤ target_fpr을 만족하는 최소 conf_thr을 탐색.
+        탐색 범위: conf_thr ∈ [0.30, 0.90), step=0.05.
         """
         n_normal = int((y_val == 0).sum())
         if n_normal == 0:
@@ -133,7 +133,7 @@ class TwoStagePipeline:
                          conf_thr: float = 0.5,
                          use_cae: bool = True,
                          device: torch.device = torch.device('cpu')):
-        """Convenience loader: build pipeline from saved artifacts."""
+        """저장된 체크포인트와 tau JSON으로부터 파이프라인을 바로 구성하는 편의 로더."""
         from src.models.cae import CAE
 
         ckpt = torch.load(cae_ckpt_path, map_location=device)

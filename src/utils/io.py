@@ -3,7 +3,7 @@ import numpy as np
 
 
 def save_dataset(X: np.ndarray, y: np.ndarray, meta: dict, path: str) -> None:
-    """X: float32 (N,3,H,W) [0,1] / y: int64 (N,) {0..5}"""
+    """데이터셋 저장. X: float32 (N,3,H,W) 범위 [0,1] / y: int64 (N,) 값 {0..5}"""
     np.savez(path, X=X, y=y, meta=json.dumps(meta))
 
 

@@ -1,10 +1,10 @@
 """
-CAE training — Normal-only samples, seed=42 fixed.
-CAE is trained once and reused across all LOAO folds.
+Phase 3: CAE 학습 — 정상(Normal) 샘플만 사용, seed=42 고정.
+CAE는 한 번만 학습하며 이후 모든 LOAO fold에서 재사용.
 
-Usage:
-  python -m src.train.train_cae           # full run (150 epochs)
-  python -m src.train.train_cae --smoke   # 1 epoch smoke test
+사용법:
+  python -m src.train.train_cae           # 전체 실행 (150 epoch)
+  python -m src.train.train_cae --smoke   # 스모크 테스트: 1 epoch
 """
 import argparse
 import copy
@@ -43,7 +43,7 @@ def _make_loader(X: np.ndarray, batch_size: int, shuffle: bool = False) -> DataL
 
 def compute_mse_batch(model: CAE, X_arr: np.ndarray,
                       device: torch.device, batch_size: int = 64) -> np.ndarray:
-    """Per-image MSE: returns shape (N,)."""
+    """이미지별 복원 오차(MSE) 계산: shape (N,) 반환."""
     model.eval()
     results = []
     for i in range(0, len(X_arr), batch_size):
@@ -60,7 +60,7 @@ def compute_mse_batch(model: CAE, X_arr: np.ndarray,
 # ---------------------------------------------------------------------------
 
 def compute_tau(mse_normal_val: np.ndarray) -> dict:
-    """Compute tau variants from val-normal MSE. Uses val-only — never train set."""
+    """val-normal MSE로부터 tau 후보값 계산. val 전용 — train set 절대 미사용."""
     n = len(mse_normal_val)
     mu    = float(mse_normal_val.mean())
     sigma = float(mse_normal_val.std(ddof=1)) if n > 1 else 0.0
@@ -81,7 +81,7 @@ def compute_tau(mse_normal_val: np.ndarray) -> dict:
 
 def compute_tau_sensitivity(mse_all: np.ndarray, y_all: np.ndarray,
                              taus: dict) -> pd.DataFrame:
-    """tau 4종 + Youden's J oracle × FPR / TPR / Youden's J table."""
+    """tau 후보별 FPR / TPR / Youden's J 민감도 테이블 생성 (oracle 포함)."""
     y_binary    = (y_all != 0).astype(int)
     normal_mask = y_all == 0
     attack_mask = ~normal_mask
@@ -285,7 +285,7 @@ def main():
                 'val_loss':    best_loss}, ckpt_path)
     print(f'[OK] cae_best.pth → {ckpt_path}')
 
-    # ---- Tau (val-normal only — training set must not be used) ----
+    # ---- Tau 계산 (val-normal 전용 — 훈련 세트 사용 금지) ----
     mse_normal_val = compute_mse_batch(model, X_normal_val, device, bs)
     taus = compute_tau(mse_normal_val)
 
@@ -301,7 +301,7 @@ def main():
     print(f'     mu={taus["mu"]:.6f}  sigma={taus["sigma"]:.6f}'
           f'  tau_2σ={taus["tau_2sigma"]:.6f}')
 
-    # ---- Visualizations (full val set: Normal + attacks) ----
+    # ---- 시각화 (val 전체: Normal + 공격 클래스 포함) ----
     mse_val = compute_mse_batch(model, X[val_idx], device, bs)
     y_val   = y[val_idx]
 

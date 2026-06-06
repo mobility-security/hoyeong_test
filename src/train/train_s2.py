@@ -1,10 +1,10 @@
 """
-Stage-2 6-class DCNN with class-weight balanced loss.
-Early stopping monitors val_macro_f1 (maximize).
+Phase 2: 6-class 공격 유형 분류 DCNN (클래스 가중치 균형 손실 적용).
+조기 종료 기준: val_macro_f1 최대화.
 
-Usage:
-  python -m src.train.train_s2           # full run: 100 epochs × 5 seeds
-  python -m src.train.train_s2 --smoke   # 1 epoch, seed 0 only
+사용법:
+  python -m src.train.train_s2           # 전체 실행: 100 epoch × 5 seed
+  python -m src.train.train_s2 --smoke   # 스모크 테스트: 1 epoch, seed 0만
 """
 import argparse
 import copy
@@ -48,7 +48,7 @@ def make_loader(X: np.ndarray, y: np.ndarray, batch_size: int,
 
 
 class EarlyStopping:
-    """Supports both min (loss) and max (F1) monitoring."""
+    """min(손실) 및 max(F1) 모드를 모두 지원하는 조기 종료."""
 
     def __init__(self, patience: int = 5, mode: str = 'max'):
         assert mode in ('min', 'max')
@@ -62,7 +62,7 @@ class EarlyStopping:
         return score > self.best if self.mode == 'max' else score < self.best
 
     def step(self, score: float, model: nn.Module) -> bool:
-        """Return True when training should stop."""
+        """학습을 중단해야 할 때 True 반환."""
         if self._improved(score):
             self.best = score
             self.counter = 0
@@ -78,7 +78,7 @@ class EarlyStopping:
 
 def _infer(model: nn.Module, loader: DataLoader,
            device: torch.device) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Returns (y_true, y_pred, y_prob_all_classes)."""
+    """(y_true, y_pred, y_prob_전체클래스) 반환."""
     model.eval()
     trues, preds, probs = [], [], []
     with torch.no_grad():
@@ -150,7 +150,7 @@ def train_one_seed(
     val_idx   = np.array(manifest['val_idx'])
     test_idx  = np.array(manifest['test_idx'])
 
-    # Class weights from train split only (val/test info excluded — no leakage)
+    # 클래스 가중치는 train split만 사용 (val/test 정보 유출 방지)
     y_train = y[train_idx]
     classes = np.arange(NUM_CLASSES)
     weights = compute_class_weight(class_weight='balanced',
@@ -206,7 +206,7 @@ def train_one_seed(
     print(f'  [seed={seed}] test → acc={accuracy:.4f}  '
           f'macro_f1={macro_f1:.4f}  weighted_f1={weighted_f1:.4f}')
 
-    # Save confusion matrix PNGs (last seed overwrites, intentional)
+    # 혼동 행렬 PNG 저장 (마지막 seed가 덮어쓰는 것은 의도된 동작)
     _save_confusion_matrices(y_true, y_pred, seed,
                              os.path.join(out_dir, 'figures'))
 
