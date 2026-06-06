@@ -138,6 +138,7 @@ def train_one_seed(
     device: torch.device,
     out_dir: str,
     max_epochs: int | None = None,
+    dropout: float = 0.5,
 ) -> dict:
     set_seed(seed)
 
@@ -161,7 +162,7 @@ def train_one_seed(
     val_loader   = make_loader(X[val_idx],   y[val_idx], bs)
     test_loader  = make_loader(X[test_idx],  y[test_idx], bs)
 
-    model     = DCNN(num_classes=NUM_CLASSES).to(device)
+    model     = DCNN(num_classes=NUM_CLASSES, dropout=dropout).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn   = nn.CrossEntropyLoss(weight=class_weights)
     stopper   = EarlyStopping(patience=patience, mode='max')
@@ -187,6 +188,20 @@ def train_one_seed(
             break
 
     stopper.restore_best(model)
+
+    # 결합 파이프라인에서 동일한 best weights를 재사용할 수 있도록 seed별 저장.
+    ckpt_dir = os.path.join(out_dir, 'checkpoints')
+    os.makedirs(ckpt_dir, exist_ok=True)
+    ckpt_path = os.path.join(ckpt_dir, f's2_seed_{seed}_best.pth')
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'num_classes': NUM_CLASSES,
+        'dropout': float(dropout),
+        'seed': seed,
+        'val_macro_f1': float(stopper.best),
+        'input_shape': tuple(X.shape[1:]),
+    }, ckpt_path)
+    print(f'  Saved checkpoint: {ckpt_path}')
 
     # --- test evaluation ---
     y_true, y_pred, _ = _infer(model, test_loader, device)
@@ -230,6 +245,7 @@ def train_one_seed(
         'weighted_f1':   weighted_f1,
         'per_class':     per_class_rows,
         'val_macro_f1_best': stopper.best,
+        'checkpoint_path': ckpt_path,
     }
 
 
@@ -271,13 +287,15 @@ def main():
     for seed in seeds:
         print(f'\n=== seed={seed} ===')
         m = train_one_seed(seed, X, y, manifest, cfg_train, device,
-                           out_dir, max_epochs)
+                           out_dir, max_epochs,
+                           dropout=float(cfg_model.dropout))
         summary_rows.append({
             'seed':             m['seed'],
             'accuracy':         m['accuracy'],
             'macro_f1':         m['macro_f1'],
             'weighted_f1':      m['weighted_f1'],
             'val_macro_f1_best': m['val_macro_f1_best'],
+            'checkpoint_path':   m['checkpoint_path'],
         })
         all_per_class.extend(m['per_class'])
 
