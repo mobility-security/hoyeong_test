@@ -1,0 +1,56 @@
+import unittest
+
+import numpy as np
+import torch
+
+from src.pipeline.two_stage import TwoStagePipeline
+
+
+class FixedS2(torch.nn.Module):
+    """첫 샘플은 Normal, 두 번째 샘플은 F_I로 약 0.8 confidence 예측."""
+
+    def forward(self, x):
+        attack = x.mean(dim=(1, 2, 3)) > 0.5
+        logits = torch.zeros((len(x), 6), device=x.device)
+        logits[:, 0] = 3.0
+        logits[attack, 0] = 0.0
+        logits[attack, 1] = 3.0
+        return logits
+
+
+class TwoStageCalibrationTest(unittest.TestCase):
+    def setUp(self):
+        self.X = np.stack([
+            np.zeros((3, 4, 4), dtype=np.float32),
+            np.ones((3, 4, 4), dtype=np.float32),
+        ])
+        self.y = np.zeros(2, dtype=np.int64)
+        self.pipeline = TwoStagePipeline(
+            cae=None,
+            s2_model=FixedS2(),
+            tau=0.0,
+            conf_thr=0.5,
+            use_cae=False,
+        )
+
+    def test_selects_highest_threshold_within_fpr_limit(self):
+        threshold = self.pipeline.calibrate_conf_thr(
+            self.X, self.y, torch.device('cpu'), target_fpr=0.5,
+        )
+        self.assertEqual(threshold, 0.8)
+
+    def test_fallback_uses_minimum_fpr_threshold(self):
+        threshold = self.pipeline.calibrate_conf_thr(
+            self.X, self.y, torch.device('cpu'), target_fpr=0.1,
+        )
+        self.assertEqual(threshold, 0.0)
+
+    def test_cae_is_required_when_enabled(self):
+        with self.assertRaises(ValueError):
+            TwoStagePipeline(
+                cae=None, s2_model=FixedS2(), tau=0.1, use_cae=True,
+            )
+
+
+if __name__ == '__main__':
+    unittest.main()
