@@ -1,6 +1,7 @@
 data/raw/
 *.pcap
 *.npz
+npz.zip
 .venv/
 __pycache__/
 *.pyc
@@ -13,3 +14,4 @@ wandb/
 dist/
 build/
 .ipynb_checkpoints/
+~$*

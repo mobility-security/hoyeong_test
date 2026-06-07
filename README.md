@@ -3,7 +3,37 @@
 차량용 이더넷 네트워크에서 발생하는 사이버 공격을 탐지·분류하는 딥러닝 기반 침입 탐지 시스템(IDS)입니다.
 PCAP에서 생성한 웨이블릿 이미지를 입력으로 받아 **2단계 게이트 파이프라인**으로 공격 유무와 유형을 분류합니다.
 
-> **현재 상태:** Phase 0~3의 모델, 학습, 데이터 분할 및 파이프라인 코드는 구현되어 있습니다. 현재 저장소의 `dataset_v0.npz`는 동작 확인용 stub이며, PCAP 전처리 코드와 실제 웨이블릿 NPZ는 팀원 전달 후 연결할 예정입니다. Phase 4 LOAO 평가는 아직 stub입니다.
+> **현재 상태:** Phase 0~3의 전처리, 모델 학습, 누수 안전 분할, 2단계 추론
+> 파이프라인까지 구현되어 있습니다. 실제 TOW-IDS PCAP/CSV에서
+> `dataset_train.npz`와 `dataset_test.npz`를 생성하는 코드가 연결되어 있으며,
+> Phase 4 LOAO 평가는 의도적으로 시그니처만 존재합니다.
+
+> **결과 해석 주의:** 현재 `split_manifest.json`은 `pcap_id` 그룹 단위로
+> 재생성되었지만, 기존 figures/tables/checkpoints는 이전 split에서 생성된 항목이
+> 포함될 수 있습니다. 최종 성능 보고 전에는 새 manifest 기준으로 S1, S2, CAE를
+> 다시 학습해야 합니다.
+
+---
+
+## 기존 저장소 대비 최신화 내용
+
+비교 기준은 `mobility-security/hoyeong`의 기존 `main` 브랜치입니다.
+
+| 영역 | 기존 저장소 | 현재 프로젝트 |
+|------|-------------|---------------|
+| 데이터 준비 | `dataset_v0.npz` stub 중심 | 실제 PCAP/CSV 파싱, 이미징, 3-wavelet 변환 및 train/test NPZ 생성 |
+| 데이터 계약 | 기본 NPZ 로드/저장 | dtype, shape, 값 범위, metadata, `pcap_id` 검증과 sidecar metadata 지원 |
+| 데이터 분할 | sample-level stratified split | `pcap_id` capture group 단위 train/validation 분할, frozen test 전체 사용 |
+| 누수 방지 | 동일 capture가 train/validation에 섞일 가능성 | 현재 manifest 기준 train/validation group 교집합 0 |
+| 2단계 추론 | Stage-2를 샘플별 반복 호출 | anomalous batch를 한 번에 GPU/CPU 추론하고 공통 라우팅 로직 사용 |
+| confidence 보정 | threshold마다 모델 재추론 | validation 추론 1회 결과를 모든 threshold 후보에 재사용 |
+| 학습 공통 코드 | S1/S2별 DataLoader와 early stopping 중복 | `src/train/common.py`로 통합, best weights를 CPU에 보관 |
+| 오류 처리 | 일부 `assert`, 암묵적 dtype 변환, 제한적 shape 검사 | 명시적 예외, 원본 dtype 검증, 모델·loss·checkpoint 입력 계약 강화 |
+| 체크포인트 보안 | 일반 `torch.load()` | state-dict checkpoint를 `weights_only=True`로 로드 |
+| 테스트 | `test_two_stage.py` 중심 3개 | I/O, 전처리, split, 모델, 학습 유틸리티 포함 45개 테스트 |
+
+현재 누수 안전 manifest 크기는 train 17,058개, validation 1,750개,
+frozen test 12,368개이며 train/validation `pcap_id` 교집합은 0입니다.
 
 ---
 
@@ -54,6 +84,7 @@ PCAP에서 생성한 웨이블릿 이미지를 입력으로 받아 **2단계 게
 │   ├── cae.yaml          # CAE 하이퍼파라미터
 │   ├── experiment.yaml   # 데이터 경로, use_cae 스위치 등
 │   ├── model.yaml        # DCNN 구조 설정
+│   ├── preprocess.yaml   # PCAP 이미징·wavelet 전처리 설정
 │   └── train.yaml        # 학습률, 배치 크기, seeds 등
 ├── data/
 │   ├── raw/              # 원본 PCAP + 레이블 CSV (git 제외 — 별도 공유)
@@ -65,24 +96,39 @@ PCAP에서 생성한 웨이블릿 이미지를 입력으로 받아 **2단계 게
 │   ├── figures/          # 혼동 행렬, MSE 히스토그램, ROC 곡선
 │   └── tables/           # CSV 결과 테이블, tau_values.json
 ├── scripts/
-│   └── make_stub_dataset.py  # 실제 데이터 없이 스모크 테스트용 stub 생성
+│   ├── build_tow_dataset.py  # 실제 TOW-IDS train/test 데이터 생성
+│   ├── make_stub_dataset.py  # 실제 데이터 없이 스모크 테스트용 stub 생성
+│   └── make_timeline.py      # 프로젝트 타임라인 그림 생성
 ├── src/
+│   ├── data/
+│   │   └── split.py      # 기존 import 호환용 split re-export
 │   ├── models/
 │   │   ├── dcnn.py       # TOW-IDS DCNN (SepConv 기반)
 │   │   └── cae.py        # Convolutional Autoencoder
 │   ├── pipeline/
 │   │   └── two_stage.py  # TwoStagePipeline (CAE + S2 연결)
 │   ├── train/
+│   │   ├── common.py     # DataLoader, device, early stopping 공통 코드
 │   │   ├── train_s1.py   # Phase 1: 이진 분류 학습
 │   │   ├── train_s2.py   # Phase 2: 6-class 분류 학습
 │   │   └── train_cae.py  # Phase 3: CAE 학습 + tau 계산
+│   ├── preprocessing/
+│   │   ├── pcap_parser.py    # PCAP/PCAPNG 파싱
+│   │   ├── imaging.py        # 패킷 window 이미지 생성
+│   │   ├── wavelet.py        # 3-wavelet LL 채널 변환
+│   │   └── build_dataset.py  # manifest 기반 전처리 오케스트레이터
 │   └── utils/
+│       ├── focal_loss.py  # S2 focal loss
 │       ├── io.py          # 데이터 로드/저장
 │       ├── metrics.py     # 평가 지표
 │       ├── seed.py        # 재현성 seed 고정
 │       └── split.py       # 시간적 누수 방지 train/val/test 분할
 ├── tests/
-│   └── test_two_stage.py  # confidence threshold 보정 회귀 테스트
+│   ├── test_io.py
+│   ├── test_preprocessing.py
+│   ├── test_split_pipeline.py
+│   ├── test_training_utils.py
+│   └── test_two_stage.py
 ├── requirements.txt
 └── spec_phase0_to_3.docx  # 전체 설계 스펙 문서
 ```
@@ -106,7 +152,8 @@ pip install -r requirements.txt
 
 ## 데이터 준비
 
-PCAP 및 전처리 데이터는 용량 문제로 git에 포함되지 않습니다. 팀원에게 별도로 받은 뒤 아래 경로에 배치합니다.
+PCAP 및 NPZ 데이터는 용량 문제로 git에 포함되지 않습니다. 팀원에게 별도로 받은 뒤
+아래 경로에 배치하거나 전처리 스크립트로 생성합니다.
 
 ```
 data/
@@ -116,8 +163,16 @@ data/
 │   ├── y_train.csv
 │   └── y_test.csv
 └── processed/
-    ├── dataset_v0.npz        # 현재는 N=200 랜덤 이미지 stub
+    ├── dataset_train.npz     # 학습 및 validation 분할 원본
+    ├── dataset_test.npz      # frozen test 원본
+    ├── dataset_v0.npz        # 선택적 smoke-test stub
     └── split_manifest.json   # 고정된 train/val/test 인덱스
+```
+
+실제 데이터 생성:
+
+```bash
+python scripts/build_tow_dataset.py
 ```
 
 학습 코드가 기대하는 NPZ 스키마는 다음과 같습니다.
@@ -134,7 +189,7 @@ data/
 
 ## 실행 방법
 
-> 모든 명령어는 **프로젝트 루트**(`MS/`)에서 실행합니다.
+> 모든 명령어는 프로젝트 루트에서 실행합니다.
 
 ### 0. 데이터 분할 (최초 1회)
 
@@ -207,24 +262,27 @@ pipeline = TwoStagePipeline.from_checkpoints(
 
 ---
 
-## 스모크 테스트 (실제 데이터 없을 때)
+## 빠른 검증
 
-실제 데이터 없이 코드가 정상 동작하는지 빠르게 확인합니다.
+실제 데이터가 없을 때는 stub 생성으로 NPZ 스키마와 I/O 계약을 확인할 수 있습니다.
 
 ```bash
-# 1. stub 데이터 생성 (N=200, 랜덤 이미지)
+# stub 데이터 생성 및 저장/로드 검증
 python scripts/make_stub_dataset.py
 
-# 2. split manifest 생성
+# 전체 회귀 테스트
+pytest tests/
+```
+
+실제 `dataset_train.npz`와 `dataset_test.npz`가 준비된 경우 전체 학습 경로를
+1 epoch로 확인할 수 있습니다.
+
+```bash
 python -m src.utils.split
 
-# 3. 각 학습 스크립트 1-epoch 테스트
 python -m src.train.train_s1 --smoke
 python -m src.train.train_s2 --smoke
 python -m src.train.train_cae --smoke
-
-# 4. 파이프라인 회귀 테스트
-pytest tests/
 ```
 
 ---
@@ -273,7 +331,7 @@ cae:
 모든 학습은 seed를 고정해 재현 가능합니다.
 
 - S1 / S2: `configs/train.yaml`의 `seeds` 리스트 전체를 순회하고 평균±표준편차로 리포트
-- S1 / S2 / S3: 동일한 `split_manifest.json`의 frozen test set 사용
+- S1 / S2 / S3: 동일한 `split_manifest.json`의 train/validation과 별도 frozen test 사용
 - S2: seed별 validation macro-F1 best checkpoint 저장
 - CAE: `seed=42` 고정 (한 번만 학습 후 모든 fold에서 재사용)
 
@@ -281,8 +339,8 @@ cae:
 
 ## 주의사항
 
-- `data/processed/split_manifest.json`은 **절대 수정하지 마세요.**
-  S1·S2·S3가 동일한 `test_idx`를 공유해야 공정한 비교가 됩니다.
+- 최종 실험을 시작한 뒤에는 `data/processed/split_manifest.json`을 수정하지 마세요.
+  S1·S2·S3가 동일한 train/validation split과 frozen test를 공유해야 합니다.
 - 실제 NPZ로 교체한 뒤에는 기존 stub manifest를 재사용하지 말고 실제 데이터 기준으로 새 manifest를 생성하세요.
 - 데이터 분할은 `pcap_id` 기반 PCAP 블록 분할을 기본으로 사용합니다. sample-level
   fallback은 누수 위험이 있으므로 명시적 옵션 없이는 실행되지 않습니다.
@@ -303,7 +361,8 @@ cae:
 
 ## Contact
 
-버그 제보, 실행 문의 및 개선 제안은 [GitHub Issues](https://github.com/kwonhoyeong/automotive-ethernet-ids/issues)에 등록해 주세요.
+버그 제보, 실행 문의 및 개선 제안은
+[GitHub Issues](https://github.com/mobility-security/hoyeong/issues)에 등록해 주세요.
 
 ## Acknowledgements
 
