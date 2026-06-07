@@ -1,0 +1,9 @@
+cae:
+  latent_dim: 128
+  lr: 1.0e-3
+  batch_size: 64
+  epochs: 150
+  patience: 12
+  lr_patience: 5
+  lr_factor: 0.5
+  noise_std: 0.05

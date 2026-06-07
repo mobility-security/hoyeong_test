@@ -1,0 +1,24 @@
+{
+  "wavelets": [
+    "coif1",
+    "db3",
+    "rbio1.3"
+  ],
+  "H": 32,
+  "W": 32,
+  "mode": "periodization",
+  "norm": "minmax01",
+  "label_map": {
+    "Normal": 0,
+    "F_I": 1,
+    "P_I": 2,
+    "M_F": 3,
+    "C_D": 4,
+    "C_R": 5
+  },
+  "seed": 0,
+  "git_sha": null,
+  "created_at": "2026-06-06T23:03:59",
+  "stub": true,
+  "note": "STUB dataset — random class-conditional signal, NOT real traffic"
+}

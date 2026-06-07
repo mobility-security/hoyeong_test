@@ -1,0 +1,15 @@
+data/raw/
+*.pcap
+*.npz
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+runs/
+*.pth
+wandb/
+.DS_Store
+*.egg-info/
+dist/
+build/
+.ipynb_checkpoints/
