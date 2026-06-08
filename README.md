@@ -509,11 +509,9 @@ S3 전체 성능은 `scripts/comparison_table.py`로 산출합니다(`results/ta
 
 ---
 
-### LOAO — 제로데이 탐지 프로토콜
+### LOAO — 제로데이 탐지 프로토콜 (5-fold × 5-seed 전체 실험 결과)
 
-**⚠ 현재 결과는 smoke 실행 (F\_I fold, seed 0, 1 epoch) 값입니다. 전체 5-fold × 5-seed 실행 후 갱신이 필요합니다.**
-
-각 fold에서 공격 클래스 1종을 학습에서 제외하고, CAE와 S2(5-class DCNN)로 해당 공격 샘플을 Unknown으로 탐지할 수 있는지 평가합니다.
+각 fold에서 공격 클래스 1종을 학습에서 제외하고, CAE와 S2(5-class DCNN)로 해당 공격 샘플을 Unknown으로 탐지할 수 있는지 평가합니다. CAE는 fold 전체에서 동일하게 재사용(tau=0.003378 고정), S2는 fold × seed마다 재학습합니다.
 
 **측정 지표 정의**
 
@@ -521,22 +519,49 @@ S3 전체 성능은 `scripts/comparison_table.py`로 산출합니다(`results/ta
 |------|------|------|
 | CAE anomaly recall | P(MSE > τ \| excluded class) | CAE가 미지 공격을 이상으로 인식하는 비율 |
 | End-to-end Unknown rate | P(pred=Unknown \| excluded class) | S3 파이프라인이 Unknown으로 최종 출력하는 비율 |
-| Normal FPR | P(MSE > τ \| Normal) | 정상 트래픽을 이상으로 오탐하는 비율 |
+| Normal FPR | P(MSE > τ \| Normal test) | 정상 트래픽을 이상으로 오탐하는 비율 |
 
-**현재 smoke 결과 (F\_I fold, seed 0, test n=570 / normal n=6,846)**
+**fold별 결과 (5-seed 평균)**
 
-| 지표 | 값 | 해석 |
-|------|-----|------|
-| CAE anomaly recall | **25.96%** | F\_I 샘플 중 26%만 CAE 임계값(τ) 초과 |
-| End-to-end Unknown rate | **12.11%** | 최종 Unknown 판정은 그보다 낮음 (S2 confidence 필터 추가) |
-| Normal FPR | **9.68%** | smoke(1 epoch)로 τ 미보정 — 전체 학습 후 4% 수준 예상 |
+| Excluded Attack | CAE Anomaly Recall | CAE Recall Std | Unknown Rate (mean) | Unknown Rate Std | Normal FPR |
+|----------------|--------------------|---------------|---------------------|-----------------|-----------|
+| F\_I (Frame Injection) | **25.96%** | 0.0% | 7.61% | 2.52% | 9.68% |
+| P\_I (PTP Sync Injection) | **100.00%** | 0.0% | 6.58% | 8.99% | 9.68% |
+| M\_F (MAC Flooding) | **100.00%** | 0.0% | 5.65% | 2.56% | 9.68% |
+| C\_D (CAN DoS) | **6.56%** | 0.0% | 0.34% | 0.26% | 9.68% |
+| C\_R (CAN Replay) | **41.96%** | 0.0% | 2.41% | 3.77% | 9.68% |
+| **Grand Mean** | **54.90%** | 39.29% | **4.52%** | 5.07% | **9.68%** |
 
-> F\_I (Frame Injection)은 AVTP 패킷 구조가 정상 트래픽과 유사하여 CAE 기준 탐지가 어렵습니다. 전체 학습 및 fold별 τ 재보정 후 수치가 크게 달라질 수 있습니다.
+> CAE Recall Std=0: tau는 fold 전체에서 고정이므로 MSE 임계값 판정은 seed와 무관하게 동일합니다.
+
+**seed별 Unknown rate (전체 25회)**
+
+| Fold \ Seed | 0 | 1 | 2 | 3 | 4 |
+|------------|---|---|---|---|---|
+| F\_I | 11.9% | 7.7% | 6.1% | 5.8% | 6.5% |
+| P\_I | 22.2% | 5.5% | 1.0% | 0.4% | 3.7% |
+| M\_F | 9.8% | 4.8% | 5.9% | 3.0% | 4.7% |
+| C\_D | 0.22% | 0.22% | 0.07% | 0.74% | 0.44% |
+| C\_R | 1.2% | 9.1% | 0.4% | 0.6% | 0.7% |
+
+**해석**
+
+- **P\_I, M\_F**: CAE anomaly recall 100%. 이 두 공격은 wavelet 이미지가 Normal과 뚜렷하게 달라 CAE가 전량 이상으로 탐지합니다. 그러나 Unknown rate는 각각 6.6%, 5.6%에 불과한데, S2가 "본 적 없는 공격임에도" 이미 알고 있는 다른 공격 클래스에 높은 confidence로 잘못 분류하기 때문입니다. 특히 P\_I의 경우 seed 0에서만 22.2%로 높고 나머지 seed에서는 0.4~5.5%로 낮습니다.
+
+- **F\_I**: CAE recall 26%. AVTP Frame Injection의 wavelet 이미지가 정상 트래픽과 매우 유사해 MSE가 τ를 넘지 않는 경우가 74%에 달합니다. CAE 단계를 통과한 샘플만 S2에 도달하므로, Unknown rate도 7.6%로 제한됩니다.
+
+- **C\_D**: CAE recall 6.6%로 가장 낮습니다. CAN DoS 패킷을 Automotive Ethernet으로 캡슐화한 트래픽이 Normal과 거의 구별되지 않습니다. Unknown rate 0.34%는 사실상 제로데이 탐지 실패 수준입니다.
+
+- **C\_R**: CAE recall 42%. seed 1에서만 Unknown rate 9.1%로 높고 나머지 seed에서는 0.4~1.2%로 낮아, S2가 대부분 경우 높은 confidence로 잘못 분류합니다.
+
+- **Normal FPR = 9.68%**: val-normal 기반으로 설정한 tau(4.09% FPR)가 test-normal에서는 9.68%로 증가했습니다. val과 test의 Normal MSE 분포가 다름을 나타내며, fold-specific τ 재보정이 필요합니다.
+
+- **Grand mean Unknown rate 4.52%**: 전체 평균은 낮지만 공격 유형별 편차가 큽니다(CAE recall std=39.3%). 제로데이 탐지 성능은 공격이 wavelet 도메인에서 Normal과 얼마나 다른지에 강하게 의존합니다.
 
 **전체 LOAO 실행 방법**
 
 ```bash
-bash scripts/run.sh loao    # 5 fold × 5 seed 전체 (수 시간 소요)
+bash scripts/run.sh loao    # 5 fold × 5 seed 전체
 bash scripts/run.sh smoke   # smoke 검증 (1 fold, 1 seed, 1 epoch)
 ```
 
