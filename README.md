@@ -383,55 +383,177 @@ pytest tests/ -q   # 59 passed 기대
 
 ## 8. 현재 실험 결과 요약
 
-> 데이터셋: TOW-IDS PCAP (train 18,808 / test 12,368 샘플, pcap_id 그룹 분할)  
-> 하드웨어: Apple M-series MPS
+> **데이터셋**: TOW-IDS PCAP (train 18,808 / test 12,368 샘플, pcap_id 캡처 그룹 단위 분할)  
+> **하드웨어**: Apple M-series MPS  
+> **재현 조건**: `split_manifest.json` 고정, seeds=[0,1,2,3,4], checkpoint 선택 기준 = val_macro_f1
 
-### S1 — 이진 분류 베이스라인 (5 seed 평균)
+---
 
-| 지표 | mean | std |
-|------|------|-----|
-| Accuracy | **0.893** | 0.031 |
-| F1 (binary) | **0.868** | 0.041 |
-| FPR (Normal) | 0.025 | 0.009 |
-| AUC-ROC | 0.912 | 0.042 |
+### S1 — 이진 분류 베이스라인 (Normal vs. Attack)
 
-### S2 — 6-class Focal Loss DCNN (5 seed 평균)
+S1은 6-class 레이블을 이진(`Normal=0 / Attack=1`)으로 변환하여 DCNN을 학습합니다. 이상 탐지 게이트(CAE)를 도입하기 전의 베이스라인 성능입니다.
 
-| 지표 | mean | std |
-|------|------|-----|
-| Accuracy | 0.919 | 0.033 |
-| macro-F1 | **0.891** | 0.056 |
-| weighted-F1 | 0.913 | 0.048 |
+**5 seed 전체 결과**
 
-**Per-class recall (5 seed 평균)**
+| Seed | Accuracy | F1 (binary) | FPR | FNR | AUC-ROC | Epochs |
+|------|----------|-------------|-----|-----|---------|--------|
+| 0 | 0.886 | 0.857 | 1.55% | 23.5% | 0.919 | 20 |
+| 1 | 0.877 | 0.848 | 3.04% | 23.7% | 0.903 | 23 |
+| 2 | 0.880 | 0.851 | 2.64% | 23.6% | 0.875 | 12 |
+| 3 | 0.874 | 0.843 | 3.64% | 23.8% | 0.882 | 19 |
+| 4 | **0.948** | **0.940** | 1.78% | 9.34% | **0.981** | 20 |
+| **mean** | **0.893** | **0.868** | **2.53%** | **20.8%** | **0.912** | 18.8 |
+| std | 0.031 | 0.041 | 0.87% | 6.40% | 0.042 | 4.1 |
 
-| 클래스 | Recall | 비고 |
-|--------|--------|------|
-| Normal | 0.934 | |
-| F\_I   | 0.846 | Frame Injection |
-| P\_I   | **0.998** | PTP Sync |
-| M\_F   | 0.986 | MAC Flooding |
-| C\_D   | **0.710** | ⚠ 최저 — std 큼 |
-| C\_R   | **0.966** | CAN Replay |
+**해석**
 
-### CAE — 이상 탐지 게이트 (seed=42 고정)
+- Seed 4가 FNR 9.3%로 나머지(23~24%)와 확연히 다릅니다. 전체 평균 FNR 20.8%는 S1이 공격의 약 21%를 놓친다는 의미로, 이진 분류만으로는 탐지 신뢰성이 부족합니다.
+- AUC-ROC 0.912는 Normal/Attack 분리 자체는 잘 학습했음을 보여주나, 결정 경계의 seed 의존성이 큽니다.
+- Seed 2는 12 epoch에서 조기 종료되어 수렴이 불완전할 가능성이 있습니다.
 
-| 지표 | 값 | 비고 |
+---
+
+### S2 — 6-class Focal Loss DCNN (공격 유형 분류)
+
+S2는 6개 클래스(Normal + 5종 공격)를 Focal Loss(γ=2, 클래스 가중치)로 학습합니다. Early stopping 기준은 val_macro_f1입니다.
+
+**5 seed 전체 결과**
+
+| Seed | Accuracy | macro-F1 | weighted-F1 | val_macro_F1 (best) |
+|------|----------|----------|-------------|---------------------|
+| 0 | 0.943 | 0.928 | 0.944 | 0.967 |
+| 1 | 0.930 | 0.912 | 0.931 | 0.957 |
+| 2 | 0.869 | **0.795** | 0.832 | 0.965 |
+| 3 | 0.906 | 0.892 | 0.908 | 0.957 |
+| 4 | **0.948** | **0.927** | **0.950** | 0.959 |
+| **mean** | **0.919** | **0.891** | **0.913** | **0.961** |
+| std | 0.033 | 0.056 | 0.048 | 0.004 |
+
+> Seed 2는 test macro-F1 0.795로 최저이나 val macro-F1은 0.965로 높습니다. val/test 분포 차이 또는 C\_D 클래스의 seed 의존성이 원인입니다.
+
+**클래스별 상세 성능 (5 seed 평균)**
+
+| 클래스 | Precision | Recall | F1 | Support (test) | 비고 |
+|--------|-----------|--------|----|----------------|------|
+| Normal | 0.931 | 0.934 | 0.931 | 6,846 | 과반수 클래스 |
+| F\_I   | 0.702 | 0.846 | 0.766 | 570 | 낮은 Precision — 타 클래스를 F\_I로 오탐 |
+| P\_I   | 0.972 | **0.998** | 0.985 | 1,192 | 거의 완벽 탐지 |
+| M\_F   | 0.978 | 0.986 | 0.981 | 793 | 안정적 |
+| C\_D   | 0.857 | **0.710** | 0.711 | 1,356 | ⚠ 최저 recall, std=0.356 |
+| C\_R   | 0.977 | 0.966 | 0.970 | 1,611 | 안정적 |
+
+**클래스별 recall std (seed 간 불안정성)**
+
+| 클래스 | recall std | 해석 |
+|--------|-----------|------|
+| C\_D | **0.356** | Seed 2에서 recall 0.083 → 사실상 탐지 실패 |
+| C\_R | 0.042 | 보통 수준 |
+| F\_I | 0.029 | 비교적 안정 |
+| Normal | 0.027 | 안정 |
+| M\_F | 0.007 | 매우 안정 |
+| P\_I | 0.001 | 최고 안정 |
+
+**해석**
+
+- **C\_D (CAN DoS)**: 전체 seed 평균 recall이 0.71에 불과하며 표준편차가 0.356으로 매우 큽니다. Seed 2에서는 recall 0.083으로 사실상 탐지 실패 수준입니다. CAN 패킷을 Automotive Ethernet으로 캡슐화한 트래픽의 wavelet 이미지가 일부 Normal 트래픽과 유사한 구조를 가지기 때문으로 추정됩니다.
+- **F\_I (Frame Injection)**: Recall 0.846으로 비교적 잘 탐지되지만 Precision이 0.702에 그칩니다. 다른 클래스가 F\_I로 잘못 분류되는 경향이 있습니다.
+- **P\_I / M\_F / C\_R**: Recall 0.966~0.998, std 0.001~0.042로 매우 안정적이고 높은 성능을 보입니다.
+
+---
+
+### CAE — 이상 탐지 게이트 (Denoising CAE, seed=42)
+
+CAE는 Normal 데이터만으로 학습하고, val-Normal MSE 분포에서 τ = μ + 2σ를 임계값으로 사용합니다. MSE > τ 이면 이상(공격 후보)으로 판정합니다.
+
+**val-Normal MSE 분포 파라미터**
+
+| 파라미터 | 값 |
+|----------|----|
+| μ (평균) | 0.002313 |
+| σ (표준편차) | 0.000533 |
+| ROC-AUC (val) | **0.940** |
+
+**임계값별 탐지 성능 비교**
+
+| 임계값 | τ 값 | Normal FPR | Attack TPR | Youden J | 비고 |
+|--------|------|-----------|-----------|---------|------|
+| **τ\_2σ** | 0.003378 | **4.09%** | 63.2% | 0.591 | ← headline (사용 중) |
+| τ\_3σ | 0.003910 | 1.85% | 49.2% | 0.473 | 보수적: FPR↓, TPR↓↓ |
+| p95 | 0.003295 | 5.01% | 66.6% | 0.616 | 공격적: FPR↑, TPR↑ |
+| p99 | 0.004217 | 1.06% | 44.8% | 0.437 | 매우 보수적 |
+| tau\_log | 0.003435 | 3.56% | 60.9% | 0.573 | log-정규 추정 |
+| Youden 최적 | 0.002678 | 18.2% | 91.1% | 0.729 | oracle 상한 (미사용) |
+
+**해석**
+
+- τ\_2σ = 0.003378에서 Normal FPR 4.09%, Attack TPR 63.2%입니다. 정상 트래픽 100개 중 4개를 불필요하게 S2로 넘기지만, 공격의 63%는 CAE 단계에서 걸러집니다.
+- p95 임계값은 Youden J가 0.616으로 τ\_2σ보다 높지만 FPR이 5.01%로 증가합니다. 배포 환경의 FPR 허용 기준에 따라 p95로 전환할 수 있습니다.
+- Youden 최적(τ=0.002678)은 TPR 91.1%이지만 FPR 18.2%로 너무 공격적입니다. 실용적으로는 사용하지 않습니다.
+- Attack TPR 63.2%는 CAE 혼자 모든 공격을 탐지하지 못한다는 의미입니다. 탐지 못한 37%는 S2가 정상 트래픽으로 라우팅되는데, S2가 높은 conf로 올바른 클래스를 출력하면 결과적으로 정확히 분류됩니다 (S3 파이프라인 특성).
+
+---
+
+### S3 — 2단계 파이프라인 전체 흐름 (CAE → S2)
+
+S3는 CAE 게이트(MSE > τ)와 S2 DCNN을 결합한 추론 파이프라인입니다. `src/pipeline/two_stage.py`의 `TwoStagePipeline`이 이를 구현합니다.
+
+```
+입력 샘플
+  ├─ CAE MSE ≤ τ (0.003378)  → Normal 출력 (CAE가 정상으로 판단)
+  └─ CAE MSE > τ             → S2 6-class DCNN 분류
+                                   ├─ max_prob ≥ 0.5  → F_I / P_I / M_F / C_D / C_R
+                                   └─ max_prob < 0.5  → Unknown (제로데이 후보)
+```
+
+S3 전체 성능은 `scripts/comparison_table.py`로 산출합니다(`results/tables/comparison_table.csv`).
+
+---
+
+### LOAO — 제로데이 탐지 프로토콜
+
+**⚠ 현재 결과는 smoke 실행 (F\_I fold, seed 0, 1 epoch) 값입니다. 전체 5-fold × 5-seed 실행 후 갱신이 필요합니다.**
+
+각 fold에서 공격 클래스 1종을 학습에서 제외하고, CAE와 S2(5-class DCNN)로 해당 공격 샘플을 Unknown으로 탐지할 수 있는지 평가합니다.
+
+**측정 지표 정의**
+
+| 지표 | 수식 | 의미 |
+|------|------|------|
+| CAE anomaly recall | P(MSE > τ \| excluded class) | CAE가 미지 공격을 이상으로 인식하는 비율 |
+| End-to-end Unknown rate | P(pred=Unknown \| excluded class) | S3 파이프라인이 Unknown으로 최종 출력하는 비율 |
+| Normal FPR | P(MSE > τ \| Normal) | 정상 트래픽을 이상으로 오탐하는 비율 |
+
+**현재 smoke 결과 (F\_I fold, seed 0, test n=570 / normal n=6,846)**
+
+| 지표 | 값 | 해석 |
 |------|-----|------|
-| ROC-AUC (val) | **0.940** | binary: Normal vs 전체 공격 |
-| Normal FPR (τ\_2σ) | **4.09%** | headline threshold |
-| Attack TPR (τ\_2σ) | 63.2% | |
-| τ\_2σ | 0.003378 | μ + 2σ of val-normal MSE |
+| CAE anomaly recall | **25.96%** | F\_I 샘플 중 26%만 CAE 임계값(τ) 초과 |
+| End-to-end Unknown rate | **12.11%** | 최종 Unknown 판정은 그보다 낮음 (S2 confidence 필터 추가) |
+| Normal FPR | **9.68%** | smoke(1 epoch)로 τ 미보정 — 전체 학습 후 4% 수준 예상 |
 
-### LOAO — 제로데이 탐지 (smoke: F\_I fold, seed 0, 1 epoch)
+> F\_I (Frame Injection)은 AVTP 패킷 구조가 정상 트래픽과 유사하여 CAE 기준 탐지가 어렵습니다. 전체 학습 및 fold별 τ 재보정 후 수치가 크게 달라질 수 있습니다.
 
-| 지표 | 값 | 설명 |
-|------|-----|------|
-| CAE anomaly recall | 0.260 | P(MSE > τ \| F\_I test) |
-| End-to-end Unknown rate | 0.121 | P(Unknown \| F\_I test) |
-| Normal FPR | 0.097 | P(MSE > τ \| Normal test) |
+**전체 LOAO 실행 방법**
 
-> ⚠ 위 LOAO 값은 1 epoch smoke 결과입니다. 전체 실험(`bash scripts/run.sh loao`) 후 갱신 필요.
+```bash
+bash scripts/run.sh loao    # 5 fold × 5 seed 전체 (수 시간 소요)
+bash scripts/run.sh smoke   # smoke 검증 (1 fold, 1 seed, 1 epoch)
+```
+
+산출물: `results/tables/loao_per_fold.csv`, `results/tables/loao_summary.csv`
+
+---
+
+### 모델별 종합 비교
+
+| 모델 | Accuracy | macro-F1 | Normal FPR | 제로데이 탐지 | 비고 |
+|------|----------|----------|-----------|-------------|------|
+| S1 (이진 DCNN) | 0.893 ± 0.031 | 0.868 ± 0.041 | 2.53% | 불가 | 베이스라인 |
+| S2 (6-class DCNN) | 0.919 ± 0.033 | 0.891 ± 0.056 | — | 불가 | Focal Loss |
+| CAE gate | — | — | 4.09% | 부분 (TPR 63%) | MSE 임계값 |
+| S3 (CAE+S2) | 전체 실행 필요 | 전체 실행 필요 | ~4.09% | Unknown 출력 | 파이프라인 |
+
+상세 비교표는 `python scripts/comparison_table.py` 실행 후 `results/tables/comparison_table.md`를 확인하세요.
 
 ---
 
