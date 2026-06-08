@@ -569,16 +569,18 @@ bash scripts/run.sh smoke   # smoke 검증 (1 fold, 1 seed, 1 epoch)
 
 ---
 
-### 모델별 종합 비교
+### 모델별 종합 비교 (5 seed, frozen test set)
 
-| 모델 | Accuracy | macro-F1 | Normal FPR | 제로데이 탐지 | 비고 |
-|------|----------|----------|-----------|-------------|------|
-| S1 (이진 DCNN) | 0.893 ± 0.031 | 0.868 ± 0.041 | 2.53% | 불가 | 베이스라인 |
-| S2 (6-class DCNN) | 0.919 ± 0.033 | 0.891 ± 0.056 | — | 불가 | Focal Loss |
-| CAE gate | — | — | 4.09% | 부분 (TPR 63%) | MSE 임계값 |
-| S3 (CAE+S2) | 전체 실행 필요 | 전체 실행 필요 | ~4.09% | Unknown 출력 | 파이프라인 |
+| 모델 | Accuracy | macro-F1 | Normal FPR | Zero-day Rate | 추론 지연 | 비고 |
+|------|----------|----------|-----------|--------------|---------|------|
+| S1 (이진 DCNN) | 0.893 ± 0.031 | 0.868 ± 0.041 | 2.53% ± 0.87% | — | 5.19 ms | 베이스라인 |
+| CAE gate (단독) | — | — | 4.09% (val) / 9.68% (test) | — | — | τ\_2σ 기준 |
+| S2 (6-class DCNN) | 0.919 ± 0.033 | 0.891 ± 0.056 | 6.58% ± 2.34% | — | 0.008 ms | Focal Loss |
+| **S3 (CAE+S2)** | **0.775 ± 0.003** | **0.637 ± 0.009** | **2.06% ± 0.40%** | **4.52%** | **0.002 ms** | 파이프라인 전체 |
 
-상세 비교표는 `python scripts/comparison_table.py` 실행 후 `results/tables/comparison_table.md`를 확인하세요.
+> **S3 accuracy/F1이 S2보다 낮은 이유**: CAE가 공격 샘플의 약 36.8%(MSE ≤ τ)를 Normal로 라우팅하여 S2에 도달하지 못합니다. 이 샘플들은 최종적으로 Normal로 오출력되어 macro-F1을 크게 낮춥니다. 반면 Normal FPR은 2.06%로 S1(2.53%)·S2(6.58%)보다 낮고, 제로데이 탐지(4.52%)는 S3만 제공합니다.
+
+상세 수치는 `results/tables/comparison_table.md` 참조.
 
 ---
 
