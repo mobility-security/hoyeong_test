@@ -29,6 +29,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from src.models.dcnn import DCNN
 from src.train.common import EarlyStopping, load_manifest, make_supervised_loader, select_device
+from src.utils.config import load_experiment_config
 from src.utils.focal_loss import FocalLoss
 from src.utils.io import LABEL_NAMES, NUM_CLASSES, load_dataset
 from src.utils.seed import set_seed
@@ -244,7 +245,7 @@ def main():
 
     cfg_model = OmegaConf.load('configs/model.yaml').model
     cfg_train = OmegaConf.load('configs/train.yaml').train
-    cfg_exp   = OmegaConf.load('configs/experiment.yaml').experiment
+    cfg_exp = load_experiment_config()
 
     if int(cfg_model.num_classes) != NUM_CLASSES:
         raise ValueError(

@@ -270,6 +270,8 @@ class TwoStagePipeline:
         y_val: np.ndarray,
         device: torch.device,
         target_fpr: float = 0.05,
+        artifact_path: str | Path | None = None,
+        manifest_sha256: str | None = None,
     ) -> float:
         """validation normal FPR 제한을 만족하는 가장 높은 confidence threshold 선택."""
         X_val = np.asarray(X_val)
@@ -303,6 +305,11 @@ class TwoStagePipeline:
         else:
             best_threshold, _ = min(results, key=lambda item: (item[1], item[0]))
         self.conf_thr = best_threshold
+        if artifact_path is not None:
+            from src.utils.config import write_conf_threshold_artifact
+            write_conf_threshold_artifact(
+                artifact_path, best_threshold, target_fpr,
+                manifest_sha256 or '')
         return best_threshold
 
     @classmethod

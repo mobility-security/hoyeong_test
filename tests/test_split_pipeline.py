@@ -13,7 +13,7 @@ from src.pipeline.two_stage import (  # noqa: E402
     CallableScorer, IdentityScorer, TwoStageIDS, compute_tau,
 )
 from src.utils.io import UNKNOWN_LABEL, build_meta, save_dataset  # noqa: E402
-from src.utils.split import make_split_manifest  # noqa: E402
+from src.utils.split import make_split_manifest, temporal_trainval_split  # noqa: E402
 
 
 def _toy(n_groups=24, per=60):
@@ -57,7 +57,8 @@ def test_manifest_uses_pcap_groups_and_train_only_normal_file(tmp_path):
     X_test = rng.random((len(y_test), 3, 4, 4), dtype=np.float32)
 
     train_path = save_dataset(
-        tmp_path / 'train.npz', X_train, y_train, build_meta(4, 4), pcap_id=groups)
+        tmp_path / 'train.npz', X_train, y_train,
+        build_meta(4, 4, group_semantics='capture'), pcap_id=groups)
     test_path = save_dataset(
         tmp_path / 'test.npz', X_test, y_test, build_meta(4, 4))
     manifest_path = tmp_path / 'split_manifest.json'
@@ -86,6 +87,25 @@ def test_manifest_rejects_missing_pcap_id_by_default(tmp_path):
     import pytest
     with pytest.raises(ValueError, match='pcap_id is required'):
         make_split_manifest(str(train_path), str(test_path), str(tmp_path / 'split.json'))
+
+
+def test_temporal_split_applies_packet_guard_and_preserves_classes():
+    packet_start = np.arange(12, dtype=np.int64) * 64
+    packet_end = packet_start + 64
+    y = np.repeat(np.arange(3), 4).astype(np.int64)
+    train, val, removed = temporal_trainval_split(
+        packet_start, packet_end, y, val_ratio=0.25, guard_gap_packets=64)
+
+    assert set(y[train]) == {0, 1, 2}
+    assert set(y[val]) == {0, 1, 2}
+    assert removed > 0
+    for tr in train:
+        for va in val:
+            distance = max(
+                int(packet_start[va] - packet_end[tr]),
+                int(packet_start[tr] - packet_end[va]),
+            )
+            assert distance >= 64
 
 
 def test_compute_tau():

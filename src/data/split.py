@@ -6,6 +6,7 @@ from src.utils.split import (
     leak_safe_trainval_split,
     make_contiguous_groups,
     normal_only_indices,
+    temporal_trainval_split,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     'leak_safe_trainval_split',
     'make_contiguous_groups',
     'normal_only_indices',
+    'temporal_trainval_split',
 ]

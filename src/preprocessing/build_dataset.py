@@ -49,7 +49,7 @@ def build(manifest_csv: str, cfg, out_path: str, seed: int = 0):
     if unknown_labels:
         raise ValueError(f'manifest contains unknown labels: {unknown_labels}')
     img_cfg, wav_cfg = cfg.imaging, cfg.wavelet
-    Xs, ys, gs = [], [], []
+    Xs, ys, gs, starts, ends = [], [], [], [], []
     for gid, row in enumerate(df.itertuples(index=False)):
         label = LABEL_MAP[row.label_name]
         frames = parse_pcap(row.pcap_path)
@@ -71,6 +71,9 @@ def build(manifest_csv: str, cfg, out_path: str, seed: int = 0):
         ))
         ys.append(ilabels)
         gs.append(igroups)
+        packet_start = np.arange(len(imgs), dtype=np.int64) * int(img_cfg.stride)
+        starts.append(packet_start)
+        ends.append(packet_start + int(img_cfg.packets_per_image))
         print(f"  {row.label_name:6s} {Path(row.pcap_path).name}: "
               f"{len(frames)} pkts → {imgs.shape[0]} imgs")
 
@@ -80,12 +83,17 @@ def build(manifest_csv: str, cfg, out_path: str, seed: int = 0):
     X = np.concatenate(Xs, 0).astype(np.float32)
     y = np.concatenate(ys, 0).astype(np.int64)
     groups = np.concatenate(gs, 0).astype(np.int64)
+    packet_start = np.concatenate(starts, 0).astype(np.int64)
+    packet_end = np.concatenate(ends, 0).astype(np.int64)
 
     meta = build_meta(X.shape[2], X.shape[3], wavelets=list(wav_cfg.names),
                       mode=wav_cfg.mode, seed=seed, git_sha=_git_sha(),
                       created_at=_dt.datetime.now().isoformat(timespec="seconds"),
-                      stub=False)
-    out = save_dataset(out_path, X, y, meta, pcap_id=groups)  # pcap_id = pcap 인덱스
+                      stub=False, group_semantics='capture',
+                      packet_range_semantics='zero_based_half_open')
+    out = save_dataset(
+        out_path, X, y, meta, pcap_id=groups,
+        packet_start=packet_start, packet_end=packet_end)
     counts = {LABEL_NAMES[c]: int((y == c).sum()) for c in range(NUM_CLASSES)}
     print(f"saved: {out}  (+ {out.with_suffix('.meta.json').name})")
     print(f"  X={X.shape}  pcap_id={len(np.unique(groups))}  counts={counts}")

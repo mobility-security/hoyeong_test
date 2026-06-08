@@ -42,7 +42,9 @@ class SchemaError(ValueError):
 
 
 def validate_schema(X: np.ndarray, y: np.ndarray, meta: dict | None = None,
-                    pcap_id: np.ndarray | None = None) -> None:
+                    pcap_id: np.ndarray | None = None,
+                    packet_start: np.ndarray | None = None,
+                    packet_end: np.ndarray | None = None) -> None:
     """계약 위반 시 SchemaError 를 raise. 통과하면 None."""
     errs: list[str] = []
 
@@ -107,6 +109,27 @@ def validate_schema(X: np.ndarray, y: np.ndarray, meta: dict | None = None,
         elif isinstance(X, np.ndarray) and X.ndim == 4 and len(pcap_id) != len(X):
             errs.append(f"len(pcap_id)={len(pcap_id)} != len(X)={len(X)}")
 
+    # --- packet provenance (선택, [start, end) 범위) ---
+    if (packet_start is None) != (packet_end is None):
+        errs.append('packet_start and packet_end must be provided together')
+    elif packet_start is not None and packet_end is not None:
+        for name, values in (('packet_start', packet_start), ('packet_end', packet_end)):
+            if not isinstance(values, np.ndarray) or values.dtype != np.int64:
+                errs.append(f'{name} must be int64 ndarray, got '
+                            f'{getattr(values, "dtype", type(values))}')
+            elif values.ndim != 1:
+                errs.append(f'{name} must be 1-D, got shape {values.shape}')
+            elif isinstance(X, np.ndarray) and X.ndim == 4 and len(values) != len(X):
+                errs.append(f'len({name})={len(values)} != len(X)={len(X)}')
+        if (isinstance(packet_start, np.ndarray) and packet_start.dtype == np.int64
+                and packet_start.ndim == 1
+                and isinstance(packet_end, np.ndarray) and packet_end.dtype == np.int64
+                and packet_end.ndim == 1 and len(packet_start) == len(packet_end)):
+            if np.any(packet_start < 0):
+                errs.append('packet_start must be non-negative')
+            if np.any(packet_end <= packet_start):
+                errs.append('packet_end must be greater than packet_start')
+
     if errs:
         raise SchemaError("dataset.npz 계약 위반:\n  - " + "\n  - ".join(errs))
 
@@ -141,20 +164,47 @@ def _json_default(o):
 
 
 def save_dataset(path: str | Path, X: np.ndarray, y: np.ndarray,
-                 meta: dict | None = None, pcap_id: np.ndarray | None = None) -> Path:
+                 meta: dict | None = None, pcap_id: np.ndarray | None = None,
+                 packet_start: np.ndarray | None = None,
+                 packet_end: np.ndarray | None = None) -> Path:
     """검증 후 npz 저장. meta 는 JSON(uint8 byte array)으로 동봉(pickle 불필요).
 
     pcap_id (선택): (N,) int64 — 각 샘플이 온 capture(PCAP) id. 누수 안전 split 용.
     저장 시 사람이 읽을 수 있는 `<path>.meta.json` sidecar 도 함께 작성한다.
     """
+    X = np.asarray(X)
+    y = np.asarray(y)
+    if not np.issubdtype(X.dtype, np.floating):
+        raise SchemaError(f'X must have a floating dtype before storage, got {X.dtype}')
+    if not np.issubdtype(y.dtype, np.integer):
+        raise SchemaError(f'y must have an integer dtype before storage, got {y.dtype}')
+    if pcap_id is not None:
+        pcap_id = np.asarray(pcap_id)
+        if not np.issubdtype(pcap_id.dtype, np.integer):
+            raise SchemaError(
+                f'pcap_id must have an integer dtype before storage, got {pcap_id.dtype}')
+    if packet_start is not None:
+        packet_start = np.asarray(packet_start)
+        if not np.issubdtype(packet_start.dtype, np.integer):
+            raise SchemaError('packet_start must have an integer dtype before storage')
+    if packet_end is not None:
+        packet_end = np.asarray(packet_end)
+        if not np.issubdtype(packet_end.dtype, np.integer):
+            raise SchemaError('packet_end must have an integer dtype before storage')
+
     X = np.ascontiguousarray(X, dtype=np.float32)
     y = np.ascontiguousarray(y, dtype=np.int64)
     if pcap_id is not None:
         pcap_id = np.ascontiguousarray(pcap_id, dtype=np.int64)
+    if packet_start is not None:
+        packet_start = np.ascontiguousarray(packet_start, dtype=np.int64)
+    if packet_end is not None:
+        packet_end = np.ascontiguousarray(packet_end, dtype=np.int64)
     if meta is None:
-        validate_schema(X, y, pcap_id=pcap_id)
+        validate_schema(X, y, pcap_id=pcap_id,
+                        packet_start=packet_start, packet_end=packet_end)
         meta = build_meta(X.shape[2], X.shape[3])
-    validate_schema(X, y, meta, pcap_id)
+    validate_schema(X, y, meta, pcap_id, packet_start, packet_end)
 
     path = Path(path)
     out = path if path.suffix == ".npz" else Path(f"{path}.npz")
@@ -165,6 +215,9 @@ def save_dataset(path: str | Path, X: np.ndarray, y: np.ndarray,
     arrays = {"X": X, "y": y, "meta_json": meta_bytes}
     if pcap_id is not None:
         arrays["pcap_id"] = pcap_id
+    if packet_start is not None:
+        arrays['packet_start'] = packet_start
+        arrays['packet_end'] = packet_end
     np.savez_compressed(out, **arrays)
     # 사람이 읽을 수 있는 meta.json sidecar (권호영 스펙)
     out.with_suffix(".meta.json").write_text(
@@ -189,13 +242,39 @@ def load_dataset(path: str | Path, with_pcap_id: bool = False):
                 meta = json.loads(bytes(npz["meta_json"]).decode("utf-8"))
             pcap_id = (np.asarray(npz["pcap_id"])
                        if "pcap_id" in npz else None)
+            packet_start = (np.asarray(npz['packet_start'])
+                            if 'packet_start' in npz else None)
+            packet_end = (np.asarray(npz['packet_end'])
+                          if 'packet_end' in npz else None)
     except (OSError, KeyError, ValueError, UnicodeDecodeError,
             json.JSONDecodeError) as exc:
         raise SchemaError(f"failed to load dataset {path}: {exc}") from exc
-    validate_schema(X, y, meta or None, pcap_id)
+    validate_schema(X, y, meta or None, pcap_id, packet_start, packet_end)
     if with_pcap_id:
         return X, y, meta, pcap_id
     return X, y, meta
+
+
+def load_provenance(path: str | Path) -> tuple[np.ndarray | None, np.ndarray | None,
+                                                np.ndarray | None]:
+    """Load capture IDs and packet ranges without loading the image tensor."""
+    path = Path(path)
+    try:
+        with np.load(path, allow_pickle=False) as npz:
+            pcap_id = np.asarray(npz['pcap_id']) if 'pcap_id' in npz else None
+            packet_start = (np.asarray(npz['packet_start'])
+                            if 'packet_start' in npz else None)
+            packet_end = np.asarray(npz['packet_end']) if 'packet_end' in npz else None
+    except (OSError, ValueError) as exc:
+        raise SchemaError(f'failed to load provenance from {path}: {exc}') from exc
+    if pcap_id is not None and (pcap_id.dtype != np.int64 or pcap_id.ndim != 1):
+        raise SchemaError('pcap_id must be a 1-D int64 array')
+    for name, values in (('packet_start', packet_start), ('packet_end', packet_end)):
+        if values is not None and (values.dtype != np.int64 or values.ndim != 1):
+            raise SchemaError(f'{name} must be a 1-D int64 array')
+    if (packet_start is None) != (packet_end is None):
+        raise SchemaError('packet_start and packet_end must be provided together')
+    return pcap_id, packet_start, packet_end
 
 
 def load_pcap_id(path: str | Path) -> np.ndarray | None:

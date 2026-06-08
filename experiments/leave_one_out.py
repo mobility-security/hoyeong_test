@@ -31,8 +31,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.models.cae import CAE
 from src.models.dcnn import DCNN
-from src.train.common import EarlyStopping, make_supervised_loader, select_device
+from src.train.common import EarlyStopping, load_manifest, make_supervised_loader, select_device
 from src.train.train_cae import compute_mse_batch
+from src.utils.config import load_experiment_config, resolve_conf_threshold
 from src.utils.focal_loss import FocalLoss
 from src.utils.io import LABEL_MAP, LABEL_NAMES, load_dataset
 from src.utils.metrics import compute_loao_metrics
@@ -42,9 +43,6 @@ from src.utils.split import leak_safe_trainval_split
 ATTACK_CLASSES: List[str] = ['F_I', 'P_I', 'M_F', 'C_D', 'C_R']
 SEEDS: List[int] = [0, 1, 2, 3, 4]
 UNKNOWN_LABEL = 6   # pipeline Unknown sentinel
-CONF_THR = 0.5
-
-
 # ---------------------------------------------------------------------------
 # Label helpers
 # ---------------------------------------------------------------------------
@@ -221,6 +219,7 @@ def run_one_fold(
     tau: float,
     cfg_train,
     device: torch.device,
+    conf_thr: float,
     seeds: List[int] = SEEDS,
     max_epochs: int | None = None,
 ) -> List[dict]:
@@ -252,11 +251,12 @@ def run_one_fold(
             cfg_train, device, num_classes=5, max_epochs=max_epochs,
         )
 
-        mse_eval, y_pred_eval = _predict_loao(cae, s2, X_eval, tau, CONF_THR, device)
+        mse_eval, y_pred_eval = _predict_loao(cae, s2, X_eval, tau, conf_thr, device)
         metrics = compute_loao_metrics(y_eval, y_pred_eval, mse_eval, tau)
 
         # Also compute on ALL test attacks of the excluded class (not just those in eval)
-        mse_excl, y_pred_excl = _predict_loao(cae, s2, X_test[excl_test_mask], tau, CONF_THR, device)
+        mse_excl, y_pred_excl = _predict_loao(
+            cae, s2, X_test[excl_test_mask], tau, conf_thr, device)
         y_label_excl = y_test[excl_test_mask]  # all == excl_id
 
         cae_recall_only = float((mse_excl > tau).mean()) if len(mse_excl) else float('nan')
@@ -314,12 +314,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('--smoke', action='store_true',
                         help='1 fold (F_I), 1 seed (0), 1 epoch')
-    parser.add_argument('--cae-ckpt', default='results/checkpoints/cae_best.pth')
-    parser.add_argument('--out-dir', default='results')
+    parser.add_argument('--cae-ckpt', default=None)
+    parser.add_argument('--out-dir', default=None)
     args = parser.parse_args()
 
     cfg_train = OmegaConf.load('configs/train.yaml').train
-    cfg_exp = OmegaConf.load('configs/experiment.yaml').experiment
+    cfg_exp = load_experiment_config()
 
     device = select_device()
     print(f'Device: {device}')
@@ -327,8 +327,10 @@ def main() -> None:
     X_train, y_train, _ = load_dataset(cfg_exp.train_npz_path)
     X_test, y_test, _ = load_dataset(cfg_exp.test_npz_path)
 
-    with open(cfg_exp.manifest_path, encoding='utf-8') as fh:
-        manifest = json.load(fh)
+    manifest = load_manifest(cfg_exp.manifest_path, len(X_train), len(X_test))
+    if str(cfg_exp.get('loao_conf_thr_mode', 'fixed')) != 'fixed':
+        raise ValueError('only loao_conf_thr_mode=fixed is currently supported')
+    conf_thr = resolve_conf_threshold(cfg_exp, manifest)
 
     train_idx = np.asarray(manifest['train_idx'], dtype=np.int64)
     val_idx = np.asarray(manifest['val_idx'], dtype=np.int64)
@@ -340,9 +342,12 @@ def main() -> None:
     print(f'Train: {X_tr.shape}  Val: {X_vl.shape}  Test: {X_test.shape}')
 
     # Load CAE once — reuse across ALL folds
-    print(f'Loading CAE from {args.cae_ckpt}')
-    cae, tau = load_cae(args.cae_ckpt, device)
+    out_dir = args.out_dir or str(cfg_exp.output_dir)
+    cae_ckpt = args.cae_ckpt or str(Path(out_dir) / 'checkpoints' / 'cae_best.pth')
+    print(f'Loading CAE from {cae_ckpt}')
+    cae, tau = load_cae(cae_ckpt, device)
     print(f'tau={tau:.6f}')
+    print(f'conf_thr={conf_thr:.3f}')
 
     folds = ATTACK_CLASSES[:1] if args.smoke else ATTACK_CLASSES
     seeds = SEEDS[:1] if args.smoke else SEEDS
@@ -363,6 +368,7 @@ def main() -> None:
             tau=tau,
             cfg_train=cfg_train,
             device=device,
+            conf_thr=conf_thr,
             seeds=seeds,
             max_epochs=max_epochs,
         )
@@ -370,7 +376,7 @@ def main() -> None:
 
     # --- Save per-fold CSV ---
     df = pd.DataFrame(all_rows)
-    out_tables = os.path.join(args.out_dir, 'tables')
+    out_tables = os.path.join(out_dir, 'tables')
     os.makedirs(out_tables, exist_ok=True)
 
     per_fold_path = os.path.join(out_tables, 'loao_per_fold.csv')

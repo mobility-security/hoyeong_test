@@ -79,6 +79,30 @@ def test_pcap_id_roundtrip_and_sidecar(tmp_path):
     assert p.with_suffix(".meta.json").exists()
 
 
+def test_save_rejects_fractional_labels_and_groups(tmp_path):
+    X, _ = _good(n=2)
+    with pytest.raises(SchemaError, match='integer dtype'):
+        save_dataset(
+            tmp_path / 'fractional_y.npz', X, np.array([0.9, 1.9]),
+            build_meta(32, 32))
+    with pytest.raises(SchemaError, match='integer dtype'):
+        save_dataset(
+            tmp_path / 'fractional_group.npz', X, np.array([0, 1], dtype=np.int64),
+            build_meta(32, 32), pcap_id=np.array([1.2, 2.8]))
+
+
+def test_packet_provenance_roundtrip(tmp_path):
+    X, y = _good(n=3)
+    starts = np.array([0, 64, 128], dtype=np.int64)
+    ends = starts + 64
+    p = save_dataset(
+        tmp_path / 'ranges.npz', X, y, build_meta(32, 32),
+        packet_start=starts, packet_end=ends)
+    with np.load(p, allow_pickle=False) as data:
+        assert np.array_equal(data['packet_start'], starts)
+        assert np.array_equal(data['packet_end'], ends)
+
+
 def test_pcap_id_length_mismatch_raises():
     X, y = _good(n=8)
     with pytest.raises(SchemaError, match="pcap_id"):

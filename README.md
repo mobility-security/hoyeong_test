@@ -50,13 +50,13 @@
 
 | 영역 | 기존 | 이 프로젝트 |
 |------|------|------------|
-| 데이터 계약 | 기본 NPZ 로드/저장 | dtype·shape·값범위·pcap_id 전수 검증 |
-| 데이터 분할 | sample-level stratified | pcap_id 캡처 그룹 단위 누수 안전 분할 |
+| 데이터 계약 | 기본 NPZ 로드/저장 | dtype·shape·값범위·캡처/패킷 provenance 전수 검증 |
+| 데이터 분할 | sample-level stratified | 다중 캡처 group split 또는 단일 캡처 시간 구간 split + guard gap |
 | 공격 분류 손실 | CrossEntropy | Focal Loss (γ=2, 클래스 가중치) |
 | 이상 탐지 게이트 | 없음 | CAE (Denoising) + τ = μ+2σ |
 | 제로데이 평가 | 없음 | LOAO 5-fold × 5-seed 프로토콜 |
 | 추론 배치화 | 샘플별 반복 | anomalous 배치 1회 GPU 추론 |
-| 테스트 | 3개 | 59개 (io, 전처리, split, 모델, 학습, LOAO) |
+| 테스트 | 3개 | 69개 (io, 전처리, split, 모델, 학습, LOAO, 회귀 검증) |
 
 ---
 
@@ -74,7 +74,7 @@ PCAP 파일 (data/raw/)
     ▼
 dataset_train.npz / dataset_test.npz
     │
-    │  src/utils/split.py  (pcap_id 그룹 단위 train/val 분할)
+    │  src/utils/split.py  (capture 그룹 또는 시간 구간 train/val 분할)
     ▼
 split_manifest.json  ──────────────────────────────────────────────────┐
     │                                                                   │
@@ -169,11 +169,13 @@ results/tables/tau_values.json                                         │
 │   │   ├── train_s1.py         # Phase 1: 이진 분류 베이스라인
 │   │   └── train_s2.py         # Phase 2: 6-class Focal Loss 분류
 │   └── utils/
+│       ├── benchmark.py        # 동기화된 반복 추론 latency 측정
+│       ├── config.py           # 실험 설정 + runtime 경로/threshold 해석
 │       ├── focal_loss.py       # Focal Loss (Lin et al., 2017)
-│       ├── io.py               # 데이터 계약: save/load/validate_schema
+│       ├── io.py               # 데이터 계약: tensor + packet provenance 검증
 │       ├── metrics.py          # compute_binary / multiclass / loao metrics
 │       ├── seed.py             # 재현성 seed 고정
-│       └── split.py            # pcap_id 그룹 단위 누수 안전 train/val 분할
+│       └── split.py            # capture 그룹/시간 구간 누수 안전 train/val 분할
 │
 ├── tests/
 │   ├── test_io.py              # 데이터 계약 검증 (17개)
@@ -181,9 +183,11 @@ results/tables/tau_values.json                                         │
 │   ├── test_preprocessing.py   # 전처리 파이프라인 (7개)
 │   ├── test_split_pipeline.py  # split + 2단계 파이프라인 (13개)
 │   ├── test_training_utils.py  # 모델·손실·EarlyStopping (5개)
-│   └── test_two_stage.py       # TwoStagePipeline 보정·라우팅 (4개)
+│   ├── test_two_stage.py       # TwoStagePipeline 보정·라우팅
+│   └── test_review_fixes.py    # smoke 격리, 지표, benchmark 회귀 검증
 │
 ├── requirements.txt
+├── requirements-dev.txt
 ├── DATASET.md
 └── spec_phase0_to_3.docx       # 전체 설계 스펙 문서
 ```
@@ -205,17 +209,14 @@ source .venv/bin/activate          # Windows: .venv\Scripts\activate
 
 # 3. 패키지 설치
 pip install --upgrade pip
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 
 # 4. 설치 확인
 python -c "import torch; print('torch:', torch.__version__, '| cuda:', torch.cuda.is_available())"
 ```
 
-**pytest 별도 설치** (requirements.txt 미포함):
-
-```bash
-pip install pytest
-```
+운영 의존성만 필요하면 `requirements.txt`, 테스트까지 실행하려면
+`requirements-dev.txt`를 사용합니다.
 
 ---
 
@@ -242,7 +243,10 @@ data/raw/
 python scripts/make_stub_dataset.py
 ```
 
-N=200 랜덤 샘플 stub NPZ(`data/processed/dataset_v0.npz`)를 생성합니다. 파이프라인 동작 확인용이며 모델 학습에는 사용하지 마세요.
+기본 명령은 합성 stub NPZ(`data/processed/dataset_v0.npz`)를 생성합니다. 전체 smoke
+실행은 서로 다른 capture group을 가진 train/test stub을 `data/smoke/`에 만들고,
+checkpoint와 표, 그림은 `results/smoke/`에만 기록합니다. 파이프라인 동작 확인용이며
+모델 성능 평가에는 사용하지 마세요.
 
 ---
 
@@ -257,7 +261,8 @@ python scripts/build_tow_dataset.py
 1. PCAP 파싱 → 64패킷 윈도우, 64바이트 페이로드 truncation/padding
 2. 64×64 grayscale 이미지 생성
 3. `coif1` / `db3` / `rbio1.3` 웨이블릿 LL 서브밴드 → (N, 3, 32, 32) float32 텐서
-4. `dataset_train.npz` / `dataset_test.npz` 저장 (meta.json sidecar 포함)
+4. `dataset_train.npz` / `dataset_test.npz` 저장
+   (`pcap_id`, `packet_start`, `packet_end`, meta.json sidecar 포함)
 
 처리 완료 후 예상 파일:
 
@@ -299,6 +304,7 @@ python -m src.utils.split \
   --test-npz  data/processed/dataset_test.npz \
   --out       data/processed/split_manifest.json \
   --val-ratio 0.10 \
+  --guard-gap-packets 64 \
   --seed      42
 ```
 
@@ -306,10 +312,12 @@ python -m src.utils.split \
 - `data/processed/split_manifest.json` — frozen train/val/test 인덱스 + sha256
 - `data/processed/normal_only_idx.npy` — CAE 학습용 Normal 인덱스
 
-`split_strategy`가 `pcap_group_stratified`인지 확인:
+여러 캡처가 있으면 `capture_group_stratified`, 단일 캡처면
+`temporal_segment_stratified`를 사용합니다. 실제 TOW-IDS 기본 입력은 단일 캡처이므로
+시간상 인접한 윈도우를 guard gap만큼 train에서 제거합니다.
 
 ```bash
-python -c "import json; print(json.load(open('data/processed/split_manifest.json'))['split_strategy'])"
+python -c "import json; m=json.load(open('data/processed/split_manifest.json')); print(m['split_strategy'], m['guard_removed_samples'])"
 ```
 
 #### Step 2. S1 — 이진 분류 베이스라인 학습
@@ -378,16 +386,19 @@ python scripts/comparison_table.py    # S1/S2/S3 3종 비교표
 #### 코드 회귀 테스트
 
 ```bash
-pytest tests/ -q   # 59 passed 기대
+pytest tests/ -q   # 69 passed 기대
 ```
 
 ---
 
 ## 8. 현재 실험 결과 요약
 
-> **데이터셋**: TOW-IDS PCAP (train 18,808 / test 12,368 샘플, pcap_id 캡처 그룹 단위 분할)  
-> **하드웨어**: Apple M-series MPS  
+> **데이터셋**: TOW-IDS PCAP (train 18,808 / test 12,368 샘플, 단일 캡처 시간 구간 분할 + guard gap)
+> **하드웨어**: Apple M-series MPS
 > **재현 조건**: `split_manifest.json` 고정, seeds=[0,1,2,3,4], checkpoint 선택 기준 = val_macro_f1
+
+아래에 커밋된 수치는 split/provenance 강화 전 실행 결과입니다. 수정된 프로토콜의 최종
+수치는 `bash scripts/run.sh all`로 데이터, checkpoint, 표를 다시 생성한 뒤 갱신해야 합니다.
 
 ---
 
@@ -628,7 +639,13 @@ experiment:
   test_npz_path:  data/processed/dataset_test.npz
   manifest_path:  data/processed/split_manifest.json
   use_cae: false    # true → CAE 게이트 활성화 / false → S2 단독
-  conf_thr: 0.5     # Stage 2 Unknown 판단 임계값
+  conf_thr: 0.5
+  conf_thr_source: fixed   # fixed | artifact
+  conf_thr_artifact: results/tables/conf_threshold.json
+  loao_conf_thr_mode: fixed
+  benchmark_batch_size: 64
+  benchmark_warmup: 2
+  benchmark_repeats: 5
   output_dir: results/
 ```
 
