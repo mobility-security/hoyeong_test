@@ -1,0 +1,3 @@
+excluded_attack,cae_recall_mean,cae_recall_std,unknown_rate_mean,unknown_rate_std,normal_fpr_mean,normal_fpr_std
+F_I,0.2596491228070175,,0.12105263157894737,,0.09684487291849254,
+grand_mean,0.2596491228070175,,0.12105263157894737,,0.09684487291849254,

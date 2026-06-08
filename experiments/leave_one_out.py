@@ -1,14 +1,291 @@
 """
 Phase 4: Leave-One-Attack-Out (LOAO) 제로데이 탐지 평가 프로토콜.
+
 공격 유형 하나를 학습에서 제외하고, 해당 공격을 Unknown으로 탐지할 수 있는지 평가.
+
+사용법:
+  python -m experiments.leave_one_out           # 전체 실행: 5 fold × 5 seed
+  python -m experiments.leave_one_out --smoke   # fold 1개, seed 1개, 1 epoch
 """
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
 from typing import List
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from omegaconf import OmegaConf
+from sklearn.metrics import f1_score
+from sklearn.utils.class_weight import compute_class_weight
+from torch.utils.data import DataLoader, TensorDataset
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.models.cae import CAE
+from src.models.dcnn import DCNN
+from src.train.common import EarlyStopping, make_supervised_loader, select_device
+from src.train.train_cae import compute_mse_batch
+from src.utils.focal_loss import FocalLoss
+from src.utils.io import LABEL_MAP, LABEL_NAMES, load_dataset
+from src.utils.metrics import compute_loao_metrics
+from src.utils.seed import set_seed
+from src.utils.split import leak_safe_trainval_split
+
+ATTACK_CLASSES: List[str] = ['F_I', 'P_I', 'M_F', 'C_D', 'C_R']
+SEEDS: List[int] = [0, 1, 2, 3, 4]
+UNKNOWN_LABEL = 6   # pipeline Unknown sentinel
+CONF_THR = 0.5
+
+
+# ---------------------------------------------------------------------------
+# Label helpers
+# ---------------------------------------------------------------------------
+
+def _remap_labels_exclude(y: np.ndarray, excl_id: int) -> tuple[np.ndarray, np.ndarray]:
+    """Exclude class `excl_id` and return (keep_mask, remapped_y).
+
+    Remapping rule: classes 0..excl_id-1 stay the same; classes excl_id+1..5
+    are shifted down by one, yielding 5 contiguous labels (0..4).
+    """
+    keep = y != excl_id
+    y_out = y[keep].copy()
+    y_out[y_out > excl_id] -= 1
+    return keep, y_out
+
+
+# ---------------------------------------------------------------------------
+# CAE loading
+# ---------------------------------------------------------------------------
+
+def load_cae(ckpt_path: str | Path, device: torch.device) -> tuple[CAE, float]:
+    """Load CAE checkpoint and tau from tau_values.json in results/tables/."""
+    ckpt_path = Path(ckpt_path)
+    ck = torch.load(ckpt_path, map_location=device, weights_only=True)
+    for key in ('model_state_dict', 'input_shape', 'latent_dim'):
+        if key not in ck:
+            raise ValueError(f'CAE checkpoint missing key: {key}')
+    cae = CAE(
+        input_shape=tuple(ck['input_shape']),
+        latent_dim=int(ck['latent_dim']),
+        noise_std=float(ck.get('noise_std', 0.05)),
+    )
+    cae.load_state_dict(ck['model_state_dict'])
+    cae.eval().to(device)
+
+    tau_path = ckpt_path.parents[1] / 'tables' / 'tau_values.json'
+    with tau_path.open(encoding='utf-8') as fh:
+        tau_data = json.load(fh)
+    tau = float(tau_data[tau_data.get('headline_tau', 'tau_2sigma')])
+    return cae, tau
+
+
+# ---------------------------------------------------------------------------
+# Stage-2 training (5-class, per fold)
+# ---------------------------------------------------------------------------
+
+def _infer_5class(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Returns (y_true, y_pred, y_prob_all_classes)."""
+    model.eval()
+    trues, preds, probs = [], [], []
+    with torch.no_grad():
+        for xb, yb in loader:
+            logits = model(xb.to(device))
+            p = F.softmax(logits, dim=1).cpu().numpy()
+            probs.append(p)
+            preds.append(logits.argmax(dim=1).cpu().numpy())
+            trues.append(yb.numpy())
+    return (
+        np.concatenate(trues).astype(np.int64),
+        np.concatenate(preds).astype(np.int64),
+        np.concatenate(probs).astype(np.float32),
+    )
+
+
+def train_s2_fold(
+    seed: int,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    cfg_train,
+    device: torch.device,
+    num_classes: int = 5,
+    max_epochs: int | None = None,
+) -> nn.Module:
+    """Train 5-class Stage-2 DCNN for one fold/seed."""
+    set_seed(seed)
+
+    epochs = max_epochs if max_epochs is not None else int(cfg_train.epochs)
+    lr = float(cfg_train.lr)
+    bs = int(cfg_train.batch_size)
+    patience = int(cfg_train.patience)
+
+    classes = np.arange(num_classes)
+    missing = np.setdiff1d(classes, np.unique(y_train))
+    if len(missing):
+        raise ValueError(f'train split missing classes: {missing.tolist()}')
+
+    weights = compute_class_weight('balanced', classes=classes, y=y_train)
+    class_weights = torch.FloatTensor(weights).to(device)
+
+    pin = device.type == 'cuda'
+    train_loader = make_supervised_loader(X_train, y_train, bs, shuffle=True, pin_memory=pin)
+    val_loader = make_supervised_loader(X_val, y_val, bs, pin_memory=pin)
+
+    model = DCNN(num_classes=num_classes, dropout=0.5).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = FocalLoss(gamma=2.0, weight=class_weights)
+    stopper = EarlyStopping(patience=patience, mode='max')
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        for xb, yb in train_loader:
+            xb = xb.to(device, non_blocking=pin)
+            yb = yb.to(device, non_blocking=pin)
+            optimizer.zero_grad(set_to_none=True)
+            loss_fn(model(xb), yb).backward()
+            optimizer.step()
+
+        _, y_vp, _ = _infer_5class(model, val_loader, device)
+        val_macro_f1 = float(f1_score(y_val, y_vp, labels=list(range(num_classes)),
+                                      average='macro', zero_division=0))
+        if stopper.step(val_macro_f1, model):
+            break
+
+    stopper.restore_best(model)
+    model.eval()
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Per-fold evaluation
+# ---------------------------------------------------------------------------
+
+def _predict_loao(
+    cae: CAE,
+    s2_model: nn.Module,
+    X: np.ndarray,
+    tau: float,
+    conf_thr: float,
+    device: torch.device,
+    batch_size: int = 64,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run LOAO pipeline on X.
+
+    Returns:
+        mse:    (N,) CAE reconstruction error
+        y_pred: (N,) final label — 0..num_classes-1 or UNKNOWN_LABEL(6)
+    """
+    mse = compute_mse_batch(cae, X, device, batch_size)
+    anomalous = mse > tau
+
+    n = len(X)
+    y_pred = np.zeros(n, dtype=np.int64)
+
+    routed = np.flatnonzero(anomalous)
+    if len(routed):
+        X_anom = X[routed]
+        with torch.no_grad():
+            logits = s2_model(torch.from_numpy(X_anom).to(device))
+            probs = F.softmax(logits, dim=1).cpu().numpy()
+        max_probs = probs.max(axis=1)
+        preds = probs.argmax(axis=1)
+        y_pred[routed] = preds
+        # Low-confidence anomalous → Unknown
+        y_pred[routed[max_probs < conf_thr]] = UNKNOWN_LABEL
+
+    return mse, y_pred
+
+
+def run_one_fold(
+    excluded_attack: str,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    cae: CAE,
+    tau: float,
+    cfg_train,
+    device: torch.device,
+    seeds: List[int] = SEEDS,
+    max_epochs: int | None = None,
+) -> List[dict]:
+    """Train Stage-2 per seed (excluded class removed), evaluate on test."""
+    excl_id = LABEL_MAP[excluded_attack]
+
+    # Build 5-class train and val sets (no excluded class)
+    train_keep, y_train_5 = _remap_labels_exclude(y_train, excl_id)
+    X_train_5 = X_train[train_keep]
+
+    val_keep, y_val_5 = _remap_labels_exclude(y_val, excl_id)
+    X_val_5 = X_val[val_keep]
+
+    # Test slices: excluded attack + Normal (for FPR)
+    excl_test_mask = y_test == excl_id
+    normal_test_mask = y_test == 0
+
+    # Combined eval slice
+    eval_mask = excl_test_mask | normal_test_mask
+    X_eval = X_test[eval_mask]
+    # y_eval: 0=Normal, keep original excl_id so compute_loao_metrics can distinguish
+    y_eval = y_test[eval_mask]
+
+    seed_results = []
+    for seed in seeds:
+        print(f'    [fold={excluded_attack}, seed={seed}] training Stage-2 (5-class)...')
+        s2 = train_s2_fold(
+            seed, X_train_5, y_train_5, X_val_5, y_val_5,
+            cfg_train, device, num_classes=5, max_epochs=max_epochs,
+        )
+
+        mse_eval, y_pred_eval = _predict_loao(cae, s2, X_eval, tau, CONF_THR, device)
+        metrics = compute_loao_metrics(y_eval, y_pred_eval, mse_eval, tau)
+
+        # Also compute on ALL test attacks of the excluded class (not just those in eval)
+        mse_excl, y_pred_excl = _predict_loao(cae, s2, X_test[excl_test_mask], tau, CONF_THR, device)
+        y_label_excl = y_test[excl_test_mask]  # all == excl_id
+
+        cae_recall_only = float((mse_excl > tau).mean()) if len(mse_excl) else float('nan')
+        unknown_rate_only = float((y_pred_excl == UNKNOWN_LABEL).mean()) if len(y_pred_excl) else float('nan')
+
+        # Normal FPR: CAE on normal test samples
+        mse_normal_test = compute_mse_batch(cae, X_test[normal_test_mask], device)
+        normal_fpr = float((mse_normal_test > tau).mean()) if len(mse_normal_test) else float('nan')
+
+        result = {
+            'excluded_attack': excluded_attack,
+            'seed': seed,
+            'cae_anomaly_recall': cae_recall_only,
+            'unknown_rate': unknown_rate_only,
+            'normal_fpr': normal_fpr,
+            'n_excl_test': int(excl_test_mask.sum()),
+            'n_normal_test': int(normal_test_mask.sum()),
+        }
+        seed_results.append(result)
+        print(f'    → cae_recall={cae_recall_only:.4f}  '
+              f'unknown_rate={unknown_rate_only:.4f}  '
+              f'normal_fpr={normal_fpr:.4f}')
+    return seed_results
 
 
 def run_loao(
-    excluded_attack: str,   # 'F_I' | 'P_I' | 'M_F' | 'C_D' | 'C_R'
+    excluded_attack: str,
     config: dict,
-    cae_model,              # 정상 데이터로 1회 학습 후 모든 fold에서 재사용
+    cae_model,
     split_manifest: dict,
 ) -> dict:
     """
@@ -17,11 +294,123 @@ def run_loao(
 
     반환값:
         {
-          'cae_anomaly_recall': float,   # P(MSE > tau | 제외된 공격 클래스)
-          'unknown_rate': float,          # 엔드투엔드 Unknown 탐지 성공률
+          'cae_anomaly_recall': float,
+          'unknown_rate': float,
           'normal_fpr': float,
           'auc_roc': float,
           'seed_results': List[dict],
         }
     """
-    raise NotImplementedError('run_loao는 Phase 4에서 구현 예정.')
+    raise NotImplementedError(
+        'run_loao() stub is not used directly. '
+        'Call run_one_fold() or use the main() CLI.')
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--smoke', action='store_true',
+                        help='1 fold (F_I), 1 seed (0), 1 epoch')
+    parser.add_argument('--cae-ckpt', default='results/checkpoints/cae_best.pth')
+    parser.add_argument('--out-dir', default='results')
+    args = parser.parse_args()
+
+    cfg_train = OmegaConf.load('configs/train.yaml').train
+    cfg_exp = OmegaConf.load('configs/experiment.yaml').experiment
+
+    device = select_device()
+    print(f'Device: {device}')
+
+    X_train, y_train, _ = load_dataset(cfg_exp.train_npz_path)
+    X_test, y_test, _ = load_dataset(cfg_exp.test_npz_path)
+
+    with open(cfg_exp.manifest_path, encoding='utf-8') as fh:
+        manifest = json.load(fh)
+
+    train_idx = np.asarray(manifest['train_idx'], dtype=np.int64)
+    val_idx = np.asarray(manifest['val_idx'], dtype=np.int64)
+    X_tr = X_train[train_idx]
+    y_tr = y_train[train_idx]
+    X_vl = X_train[val_idx]
+    y_vl = y_train[val_idx]
+
+    print(f'Train: {X_tr.shape}  Val: {X_vl.shape}  Test: {X_test.shape}')
+
+    # Load CAE once — reuse across ALL folds
+    print(f'Loading CAE from {args.cae_ckpt}')
+    cae, tau = load_cae(args.cae_ckpt, device)
+    print(f'tau={tau:.6f}')
+
+    folds = ATTACK_CLASSES[:1] if args.smoke else ATTACK_CLASSES
+    seeds = SEEDS[:1] if args.smoke else SEEDS
+    max_epochs = 1 if args.smoke else None
+
+    all_rows: List[dict] = []
+    for excluded in folds:
+        print(f'\n=== Fold: exclude={excluded} ===')
+        rows = run_one_fold(
+            excluded_attack=excluded,
+            X_train=X_tr,
+            y_train=y_tr,
+            X_val=X_vl,
+            y_val=y_vl,
+            X_test=X_test,
+            y_test=y_test,
+            cae=cae,
+            tau=tau,
+            cfg_train=cfg_train,
+            device=device,
+            seeds=seeds,
+            max_epochs=max_epochs,
+        )
+        all_rows.extend(rows)
+
+    # --- Save per-fold CSV ---
+    df = pd.DataFrame(all_rows)
+    out_tables = os.path.join(args.out_dir, 'tables')
+    os.makedirs(out_tables, exist_ok=True)
+
+    per_fold_path = os.path.join(out_tables, 'loao_per_fold.csv')
+    df.to_csv(per_fold_path, index=False)
+    print(f'\nSaved: {per_fold_path}')
+
+    # --- Summary: 5-fold mean±std ---
+    metric_cols = ['cae_anomaly_recall', 'unknown_rate', 'normal_fpr']
+    agg = df.groupby('excluded_attack')[metric_cols].agg(['mean', 'std']).reset_index()
+    agg.columns = ['excluded_attack'] + [f'{m}_{s}' for m, s in agg.columns[1:]]
+
+    # Grand mean±std across folds
+    grand = {col: df[col].mean() for col in metric_cols}
+    grand_std = {col: df[col].std() for col in metric_cols}
+    summary_rows = []
+    for _, row in agg.iterrows():
+        summary_rows.append({
+            'excluded_attack': row['excluded_attack'],
+            'cae_recall_mean': row['cae_anomaly_recall_mean'],
+            'cae_recall_std': row['cae_anomaly_recall_std'],
+            'unknown_rate_mean': row['unknown_rate_mean'],
+            'unknown_rate_std': row['unknown_rate_std'],
+            'normal_fpr_mean': row['normal_fpr_mean'],
+            'normal_fpr_std': row['normal_fpr_std'],
+        })
+    summary_rows.append({
+        'excluded_attack': 'grand_mean',
+        'cae_recall_mean': grand['cae_anomaly_recall'],
+        'cae_recall_std': grand_std['cae_anomaly_recall'],
+        'unknown_rate_mean': grand['unknown_rate'],
+        'unknown_rate_std': grand_std['unknown_rate'],
+        'normal_fpr_mean': grand['normal_fpr'],
+        'normal_fpr_std': grand_std['normal_fpr'],
+    })
+    df_summary = pd.DataFrame(summary_rows)
+    summary_path = os.path.join(out_tables, 'loao_summary.csv')
+    df_summary.to_csv(summary_path, index=False)
+    print(f'Saved: {summary_path}')
+    print(df_summary.to_string(index=False))
+
+
+if __name__ == '__main__':
+    main()
