@@ -1,4 +1,5 @@
-data/raw/
+data/raw/*
+!data/raw/README.md
 *.pcap
 *.npz
 npz.zip

@@ -116,6 +116,8 @@ results/tables/tau_values.json                                         │
 
 ## 3. 디렉터리 구조
 
+각 주요 디렉터리에는 역할, 주요 파일, 입출력과 실행 방법을 설명하는 `README.md`가 있습니다.
+
 ```
 .
 ├── configs/
