@@ -1,0 +1,2 @@
+excluded_attack,seed,cae_anomaly_recall,unknown_rate,normal_fpr,n_excl_test,n_normal_test
+F_I,0,0.2596491228070175,0.12105263157894737,0.09684487291849254,570,6846
