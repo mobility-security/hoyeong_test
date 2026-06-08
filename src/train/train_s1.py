@@ -6,8 +6,6 @@ Phase 1 베이스라인: 이진 분류 DCNN (Normal vs Attack).
   python -m src.train.train_s1 --smoke   # 스모크 테스트: 1 epoch, seed 0만
 """
 import argparse
-import copy
-import json
 import os
 import sys
 
@@ -19,10 +17,10 @@ from omegaconf import OmegaConf
 from sklearn.metrics import (
     accuracy_score, confusion_matrix, f1_score, roc_auc_score,
 )
-from torch.utils.data import DataLoader, TensorDataset
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from src.models.dcnn import DCNN
+from src.train.common import EarlyStopping, load_manifest, make_supervised_loader, select_device
 from src.utils.io import load_dataset
 from src.utils.seed import set_seed
 
@@ -34,34 +32,6 @@ from src.utils.seed import set_seed
 def binarize(y: np.ndarray) -> np.ndarray:
     """다중 클래스 레이블을 이진으로 변환: 0=Normal, 1=Attack."""
     return (y != 0).astype(np.int64)
-
-
-class EarlyStopping:
-    def __init__(self, patience: int = 5):
-        self.patience = patience
-        self.best_loss = float('inf')
-        self.counter = 0
-        self.best_weights = None
-
-    def step(self, val_loss: float, model: nn.Module) -> bool:
-        """학습을 중단해야 할 때 True 반환."""
-        if val_loss < self.best_loss:
-            self.best_loss = val_loss
-            self.counter = 0
-            self.best_weights = copy.deepcopy(model.state_dict())
-        else:
-            self.counter += 1
-        return self.counter >= self.patience
-
-    def restore_best(self, model: nn.Module) -> None:
-        if self.best_weights is not None:
-            model.load_state_dict(self.best_weights)
-
-
-def make_loader(X: np.ndarray, y: np.ndarray, batch_size: int,
-                shuffle: bool = False) -> DataLoader:
-    ds = TensorDataset(torch.from_numpy(X), torch.from_numpy(y))
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
 
 
 def eval_metrics(y_true: np.ndarray, y_pred: np.ndarray,
@@ -88,6 +58,8 @@ def train_one_seed(
     seed: int,
     X: np.ndarray,
     y_bin: np.ndarray,
+    X_test: np.ndarray,
+    y_test_bin: np.ndarray,
     manifest: dict,
     cfg_train,
     device: torch.device,
@@ -99,25 +71,27 @@ def train_one_seed(
     lr       = float(cfg_train.lr)
     bs       = int(cfg_train.batch_size)
     patience = int(cfg_train.patience)
+    if epochs < 1:
+        raise ValueError(f'epochs must be positive, got {epochs}')
+    if lr <= 0:
+        raise ValueError(f'lr must be positive, got {lr}')
 
-    # S1/S2/S3 비교가 유효하도록 모든 seed가 동일한 frozen split을 사용한다.
+    # train/val: dataset_train.npz 인덱스 / test: dataset_test.npz 전체
     idx_train = np.asarray(manifest['train_idx'], dtype=np.int64)
-    idx_val   = np.asarray(manifest['val_idx'], dtype=np.int64)
-    idx_test  = np.asarray(manifest['test_idx'], dtype=np.int64)
-    for name, split_idx in [('train', idx_train), ('val', idx_val), ('test', idx_test)]:
-        if len(split_idx) == 0:
-            raise ValueError(f'{name} split is empty')
-        if split_idx.min() < 0 or split_idx.max() >= len(X):
-            raise ValueError(f'{name} split contains indices outside dataset size {len(X)}')
+    idx_val = np.asarray(manifest['val_idx'], dtype=np.int64)
 
-    train_loader = make_loader(X[idx_train], y_bin[idx_train], bs, shuffle=True)
-    val_loader   = make_loader(X[idx_val],   y_bin[idx_val],   bs)
-    test_loader  = make_loader(X[idx_test],  y_bin[idx_test],  bs)
+    pin_memory = device.type == 'cuda'
+    train_loader = make_supervised_loader(
+        X[idx_train], y_bin[idx_train], bs, shuffle=True, pin_memory=pin_memory)
+    val_loader = make_supervised_loader(
+        X[idx_val], y_bin[idx_val], bs, pin_memory=pin_memory)
+    test_loader = make_supervised_loader(
+        X_test, y_test_bin, bs, pin_memory=pin_memory)
 
     model     = DCNN(num_classes=2).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn   = nn.CrossEntropyLoss()
-    stopper   = EarlyStopping(patience=patience)
+    stopper = EarlyStopping(patience=patience, mode='min')
 
     val_loss_history = []
 
@@ -125,8 +99,9 @@ def train_one_seed(
         # train
         model.train()
         for xb, yb in train_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            optimizer.zero_grad()
+            xb = xb.to(device, non_blocking=pin_memory)
+            yb = yb.to(device, non_blocking=pin_memory)
+            optimizer.zero_grad(set_to_none=True)
             loss_fn(model(xb), yb).backward()
             optimizer.step()
 
@@ -135,13 +110,14 @@ def train_one_seed(
         running_loss, n = 0.0, 0
         with torch.no_grad():
             for xb, yb in val_loader:
-                xb, yb = xb.to(device), yb.to(device)
+                xb = xb.to(device, non_blocking=pin_memory)
+                yb = yb.to(device, non_blocking=pin_memory)
                 running_loss += loss_fn(model(xb), yb).item() * len(xb)
                 n += len(xb)
         val_loss = running_loss / n
         val_loss_history.append(val_loss)
         print(f'  [seed={seed}] epoch={epoch}/{epochs}  val_loss={val_loss:.4f}'
-              f'  (best={stopper.best_loss:.4f}, patience={stopper.counter}/{patience})')
+              f'  (best={stopper.best:.4f}, patience={stopper.counter}/{patience})')
 
         if stopper.step(val_loss, model):
             print(f'  EarlyStopping: stopped at epoch {epoch}, restoring best weights.')
@@ -183,18 +159,20 @@ def main():
     cfg_train = OmegaConf.load('configs/train.yaml').train
     cfg_exp   = OmegaConf.load('configs/experiment.yaml').experiment
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = select_device()
     print(f'Using device: {device}')
 
-    X, y, meta = load_dataset(cfg_exp.npz_path)
-    y_bin = binarize(y)
+    X,      y,      _ = load_dataset(cfg_exp.train_npz_path)
+    X_test, y_test, _ = load_dataset(cfg_exp.test_npz_path)
+    y_bin      = binarize(y)
+    y_test_bin = binarize(y_test)
     unique, counts = np.unique(y_bin, return_counts=True)
-    print(f'Dataset: X={X.shape}  binary distribution: {dict(zip(unique.tolist(), counts.tolist()))}')
+    print(f'Train: X={X.shape}  binary={dict(zip(unique.tolist(), counts.tolist()))}')
+    print(f'Test:  X={X_test.shape}')
 
-    with open(cfg_exp.manifest_path) as f:
-        manifest = json.load(f)
+    manifest = load_manifest(cfg_exp.manifest_path, len(X), len(X_test))
     print(f'Manifest: train={len(manifest["train_idx"])}, '
-          f'val={len(manifest["val_idx"])}, test={len(manifest["test_idx"])}')
+          f'val={len(manifest["val_idx"])}, test(frozen)={len(manifest["test_idx"])}')
 
     seeds      = [0] if args.smoke else list(cfg_train.seeds)
     max_epochs = 1   if args.smoke else None
@@ -202,7 +180,8 @@ def main():
     rows = []
     for seed in seeds:
         print(f'\n=== seed={seed} ===')
-        m = train_one_seed(seed, X, y_bin, manifest, cfg_train, device, max_epochs)
+        m = train_one_seed(seed, X, y_bin, X_test, y_test_bin,
+                           manifest, cfg_train, device, max_epochs)
         rows.append({
             'seed':          m['seed'],
             'accuracy':      m['accuracy'],

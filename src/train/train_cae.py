@@ -7,7 +7,6 @@ CAE는 한 번만 학습하며 이후 모든 LOAO fold에서 재사용.
   python -m src.train.train_cae --smoke   # 스모크 테스트: 1 epoch
 """
 import argparse
-import copy
 import json
 import os
 import sys
@@ -25,10 +24,10 @@ from torch.utils.data import DataLoader, TensorDataset
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from src.models.cae import CAE
+from src.train.common import EarlyStopping, load_manifest, select_device
 from src.utils.io import load_dataset
 from src.utils.seed import set_seed
 
-CLASS_NAMES = {0: 'Normal', 1: 'F_I', 2: 'P_I', 3: 'M_F', 4: 'C_D', 5: 'C_R'}
 ATTACK_COLORS = ['#e74c3c', '#2ecc71', '#f39c12', '#9b59b6', '#1abc9c']
 
 
@@ -44,6 +43,10 @@ def _make_loader(X: np.ndarray, batch_size: int, shuffle: bool = False) -> DataL
 def compute_mse_batch(model: CAE, X_arr: np.ndarray,
                       device: torch.device, batch_size: int = 64) -> np.ndarray:
     """이미지별 복원 오차(MSE) 계산: shape (N,) 반환."""
+    if X_arr.ndim != 4:
+        raise ValueError(f'X_arr must be 4-D, got {X_arr.shape}')
+    if batch_size < 1:
+        raise ValueError(f'batch_size must be positive, got {batch_size}')
     model.eval()
     results = []
     for i in range(0, len(X_arr), batch_size):
@@ -61,6 +64,11 @@ def compute_mse_batch(model: CAE, X_arr: np.ndarray,
 
 def compute_tau(mse_normal_val: np.ndarray) -> dict:
     """val-normal MSE로부터 tau 후보값 계산. val 전용 — train set 절대 미사용."""
+    mse_normal_val = np.asarray(mse_normal_val, dtype=np.float64).reshape(-1)
+    if len(mse_normal_val) == 0:
+        raise ValueError('at least one validation-normal score is required')
+    if not np.isfinite(mse_normal_val).all() or np.any(mse_normal_val < 0):
+        raise ValueError('validation-normal MSE must contain finite non-negative values')
     n = len(mse_normal_val)
     mu    = float(mse_normal_val.mean())
     sigma = float(mse_normal_val.std(ddof=1)) if n > 1 else 0.0
@@ -188,28 +196,45 @@ def main():
     cfg_exp = OmegaConf.load('configs/experiment.yaml').experiment
     set_seed(42)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = select_device()
     print(f'Using device: {device}')
 
     # ---- Load data + manifest ----
-    X, y, _ = load_dataset(cfg_exp.npz_path)
-    with open(cfg_exp.manifest_path) as f:
-        manifest = json.load(f)
+    # CAE는 train 데이터만 사용 (test는 절대 사용 금지)
+    X, y, _ = load_dataset(cfg_exp.train_npz_path)
+    manifest = load_manifest(cfg_exp.manifest_path, len(X))
 
-    normal_train_idx = np.array(manifest['normal_train_idx'])
-    normal_val_idx   = np.array(manifest['normal_val_idx'])
-    val_idx          = np.array(manifest['val_idx'])
+    normal_train_idx = np.asarray(manifest.get('normal_train_idx', []), dtype=np.int64)
+    normal_val_idx = np.asarray(manifest.get('normal_val_idx', []), dtype=np.int64)
+    val_idx = np.asarray(manifest['val_idx'], dtype=np.int64)
 
     print(f'Normal — train={len(normal_train_idx)}, val={len(normal_val_idx)}')
-    assert len(normal_train_idx) > 0, 'No normal training samples!'
+    if len(normal_train_idx) == 0:
+        raise ValueError('normal_train_idx is empty')
+    if len(normal_val_idx) == 0:
+        raise ValueError('normal_val_idx is empty; tau cannot be calibrated on train data')
+    if (normal_train_idx.min() < 0 or normal_train_idx.max() >= len(X)
+            or normal_val_idx.min() < 0 or normal_val_idx.max() >= len(X)):
+        raise ValueError('normal_train_idx/normal_val_idx contain out-of-range indices')
+    if (len(np.setdiff1d(normal_train_idx, manifest['train_idx']))
+            or len(np.setdiff1d(normal_val_idx, manifest['val_idx']))):
+        raise ValueError('normal indices must be subsets of their corresponding splits')
+    if np.any(y[normal_train_idx] != 0) or np.any(y[normal_val_idx] != 0):
+        raise ValueError('normal_train_idx/normal_val_idx contain attack labels')
 
     X_normal_train = X[normal_train_idx]
-    X_normal_val   = X[normal_val_idx] if len(normal_val_idx) else X_normal_train[:2]
+    X_normal_val = X[normal_val_idx]
 
     bs      = int(cfg_cae.batch_size)
     lr      = float(cfg_cae.lr)
     epochs  = 1 if args.smoke else int(cfg_cae.epochs)
     patience = int(cfg_cae.patience)
+    if epochs < 1:
+        raise ValueError(f'epochs must be positive, got {epochs}')
+    if lr <= 0:
+        raise ValueError(f'lr must be positive, got {lr}')
+    if bs < 1:
+        raise ValueError(f'batch_size must be positive, got {bs}')
 
     train_loader = _make_loader(X_normal_train, bs, shuffle=True)
     val_loader   = _make_loader(X_normal_val,   bs, shuffle=False)
@@ -222,7 +247,8 @@ def main():
     n_params = model.n_params()
     print(f'CAE params: {n_params:,}  '
           f'({"OK < 5 M" if n_params < 5_000_000 else "WARN > 5 M"})')
-    assert n_params < 5_000_000, f'Model too large: {n_params}'
+    if n_params >= 5_000_000:
+        raise ValueError(f'Model too large: {n_params}')
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -231,7 +257,7 @@ def main():
         factor=float(cfg_cae.lr_factor),
     )
 
-    best_loss, best_weights, patience_ctr = float('inf'), None, 0
+    stopper = EarlyStopping(patience=patience, mode='min')
 
     # ---- Training loop ----
     for epoch in range(1, epochs + 1):
@@ -239,7 +265,7 @@ def main():
         tr_loss_acc, tr_n = 0.0, 0
         for (xb,) in train_loader:
             xb = xb.to(device)
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             xhat = model(xb, training=True)
             loss = ((xhat - xb) ** 2).mean(dim=(1, 2, 3)).mean()
             loss.backward()
@@ -261,28 +287,23 @@ def main():
 
         print(f'  epoch={epoch}/{epochs}  train_loss={tr_loss:.6f}'
               f'  val_loss={vl_loss:.6f}'
-              f'  (best={best_loss:.6f}, patience={patience_ctr}/{patience})')
+              f'  (best={stopper.best:.6f}, patience={stopper.counter}/{patience})')
 
-        if vl_loss < best_loss:
-            best_loss    = vl_loss
-            patience_ctr = 0
-            best_weights = copy.deepcopy(model.state_dict())
-        else:
-            patience_ctr += 1
-            if patience_ctr >= patience:
-                print(f'  EarlyStopping at epoch {epoch}.')
-                break
+        if stopper.step(vl_loss, model):
+            print(f'  EarlyStopping at epoch {epoch}.')
+            break
 
-    if best_weights is not None:
-        model.load_state_dict(best_weights)
+    stopper.restore_best(model)
 
     # ---- Save model ----
-    os.makedirs('results/checkpoints', exist_ok=True)
-    ckpt_path = 'results/checkpoints/cae_best.pth'
+    checkpoint_dir = os.path.join(cfg_exp.output_dir.rstrip('/'), 'checkpoints')
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    ckpt_path = os.path.join(checkpoint_dir, 'cae_best.pth')
     torch.save({'model_state_dict': model.state_dict(),
                 'input_shape': input_shape,
                 'latent_dim':  int(cfg_cae.latent_dim),
-                'val_loss':    best_loss}, ckpt_path)
+                'noise_std':   float(cfg_cae.noise_std),
+                'val_loss':    stopper.best}, ckpt_path)
     print(f'[OK] cae_best.pth → {ckpt_path}')
 
     # ---- Tau 계산 (val-normal 전용 — 훈련 세트 사용 금지) ----
@@ -295,7 +316,7 @@ def main():
     os.makedirs(fig_dir, exist_ok=True)
 
     tau_path = os.path.join(tbl_dir, 'tau_values.json')
-    with open(tau_path, 'w') as f:
+    with open(tau_path, 'w', encoding='utf-8') as f:
         json.dump(taus, f, indent=2)
     print(f'[OK] tau_values.json → {tau_path}')
     print(f'     mu={taus["mu"]:.6f}  sigma={taus["sigma"]:.6f}'
@@ -317,7 +338,7 @@ def main():
     print(df_sens.to_string(index=False))
 
     print(f'\n=== CAE Summary ===')
-    print(f'  params={n_params:,}  best_val_loss={best_loss:.6f}  ROC-AUC={auc:.4f}')
+    print(f'  params={n_params:,}  best_val_loss={stopper.best:.6f}  ROC-AUC={auc:.4f}')
     print(f'  tau_2σ={taus["tau_2sigma"]:.6f}  '
           f'tau_3σ={taus["tau_3sigma"]:.6f}  '
           f'p95={taus["p95"]:.6f}')

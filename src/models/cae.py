@@ -13,7 +13,14 @@ class CAE(nn.Module):
                  latent_dim: int = 128,
                  noise_std: float = 0.05):
         super().__init__()
-        C, H, W = input_shape
+        if len(input_shape) != 3 or any(int(size) <= 0 for size in input_shape):
+            raise ValueError(f'input_shape must be positive (C,H,W), got {input_shape}')
+        if latent_dim < 1:
+            raise ValueError(f'latent_dim must be positive, got {latent_dim}')
+        if noise_std < 0:
+            raise ValueError(f'noise_std must be non-negative, got {noise_std}')
+        C, H, W = map(int, input_shape)
+        self.input_shape = (C, H, W)
         self.noise_std = noise_std
 
         # 인코더: stride-2 합성곱 3단계 → 공간 해상도 ÷8
@@ -27,8 +34,10 @@ class CAE(nn.Module):
         )
 
         # 임의의 H, W에 대해 실제 인코더 출력 크기를 프로브로 확인 (수식 가정 없음)
+        self.encoder.eval()
         with torch.no_grad():
             probe = self.encoder(torch.zeros(1, C, H, W))
+        self.encoder.train()
         _, C_enc, H_enc, W_enc = probe.shape
         self._shape_enc = (C_enc, H_enc, W_enc)
         flat_dim = C_enc * H_enc * W_enc
@@ -48,6 +57,10 @@ class CAE(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, training: bool = False) -> torch.Tensor:
+        if x.ndim != 4 or tuple(x.shape[1:]) != self.input_shape:
+            raise ValueError(
+                f'input must have shape (N,{self.input_shape[0]},'
+                f'{self.input_shape[1]},{self.input_shape[2]}), got {tuple(x.shape)}')
         H, W = x.shape[2], x.shape[3]
 
         # 학습 중 노이즈 추가: 항등 함수로 과적합하는 것을 방지 (Denoising CAE)

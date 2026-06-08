@@ -1,0 +1,18 @@
+# 전처리 파이프라인 설정 (Team A / 김민세)
+# ⚠️ R3: 원본 TOW-IDS의 정확한 N×M·정규화는 IEEE DataPort paywall로 미확인.
+#     아래는 팀의 명시적 "가정"이며, 팀 보유 논문 PDF Section III 확인 후 갱신.
+
+imaging:
+  packets_per_image: 64     # 연속 N개 패킷을 한 이미지로
+  bytes_per_packet: 64      # 패킷 payload 를 M 바이트로 패딩/절단
+  stride: 64                # 윈도우 stride (=packets_per_image → non-overlap, 누수 최소화)
+  normalize: "div255"       # wavelet 이전 정규화: byte/255 → [0,1]
+
+wavelet:
+  names: ["coif1", "db3", "rbio1.3"]
+  level: 1                  # ⚠️ single-level dwt2 는 H/W 를 절반으로 (64→32)
+  mode: "periodization"
+  keep: "LL"                # approximation sub-band 만 채널로 사용
+  channel_norm: "minmax01"  # DWT 후 채널별 min-max → [0,1] (계약 충족)
+
+# 최종 텐서: (3, 32, 32)  =  pre-wavelet 64x64  →  level-1 dwt2  →  32x32 x3채널

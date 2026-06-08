@@ -7,11 +7,9 @@ Phase 2: 6-class 공격 유형 분류 DCNN (클래스 가중치 균형 손실 �
   python -m src.train.train_s2 --smoke   # 스모크 테스트: 1 epoch, seed 0만
 """
 import argparse
-import copy
 import os
 import sys
 
-import json
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -26,55 +24,21 @@ from sklearn.metrics import (
     classification_report, confusion_matrix, f1_score,
 )
 from sklearn.utils.class_weight import compute_class_weight
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from src.models.dcnn import DCNN
-from src.utils.io import load_dataset
+from src.train.common import EarlyStopping, load_manifest, make_supervised_loader, select_device
+from src.utils.focal_loss import FocalLoss
+from src.utils.io import LABEL_NAMES, NUM_CLASSES, load_dataset
 from src.utils.seed import set_seed
 
-CLASS_NAMES = ['Normal', 'F_I', 'P_I', 'M_F', 'C_D', 'C_R']
-NUM_CLASSES  = 6
+CLASS_NAMES = LABEL_NAMES
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def make_loader(X: np.ndarray, y: np.ndarray, batch_size: int,
-                shuffle: bool = False) -> DataLoader:
-    ds = TensorDataset(torch.from_numpy(X), torch.from_numpy(y))
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=False)
-
-
-class EarlyStopping:
-    """min(손실) 및 max(F1) 모드를 모두 지원하는 조기 종료."""
-
-    def __init__(self, patience: int = 5, mode: str = 'max'):
-        assert mode in ('min', 'max')
-        self.patience = patience
-        self.mode = mode
-        self.best = float('-inf') if mode == 'max' else float('inf')
-        self.counter = 0
-        self.best_weights = None
-
-    def _improved(self, score: float) -> bool:
-        return score > self.best if self.mode == 'max' else score < self.best
-
-    def step(self, score: float, model: nn.Module) -> bool:
-        """학습을 중단해야 할 때 True 반환."""
-        if self._improved(score):
-            self.best = score
-            self.counter = 0
-            self.best_weights = copy.deepcopy(model.state_dict())
-        else:
-            self.counter += 1
-        return self.counter >= self.patience
-
-    def restore_best(self, model: nn.Module) -> None:
-        if self.best_weights is not None:
-            model.load_state_dict(self.best_weights)
-
 
 def _infer(model: nn.Module, loader: DataLoader,
            device: torch.device) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -133,6 +97,8 @@ def train_one_seed(
     seed: int,
     X: np.ndarray,
     y: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
     manifest: dict,
     cfg_train,
     device: torch.device,
@@ -146,39 +112,56 @@ def train_one_seed(
     lr       = float(cfg_train.lr)
     bs       = int(cfg_train.batch_size)
     patience = int(cfg_train.patience)
+    if epochs < 1:
+        raise ValueError(f'epochs must be positive, got {epochs}')
+    if lr <= 0:
+        raise ValueError(f'lr must be positive, got {lr}')
 
-    train_idx = np.array(manifest['train_idx'])
-    val_idx   = np.array(manifest['val_idx'])
-    test_idx  = np.array(manifest['test_idx'])
+    train_idx = np.asarray(manifest['train_idx'], dtype=np.int64)
+    val_idx = np.asarray(manifest['val_idx'], dtype=np.int64)
 
     # 클래스 가중치는 train split만 사용 (val/test 정보 유출 방지)
     y_train = y[train_idx]
     classes = np.arange(NUM_CLASSES)
+    missing_classes = np.setdiff1d(classes, np.unique(y_train))
+    if len(missing_classes):
+        raise ValueError(f'train split is missing classes: {missing_classes.tolist()}')
     weights = compute_class_weight(class_weight='balanced',
                                    classes=classes, y=y_train)
     class_weights = torch.FloatTensor(weights).to(device)
 
-    train_loader = make_loader(X[train_idx], y_train,   bs, shuffle=True)
-    val_loader   = make_loader(X[val_idx],   y[val_idx], bs)
-    test_loader  = make_loader(X[test_idx],  y[test_idx], bs)
+    pin_memory = device.type == 'cuda'
+    train_loader = make_supervised_loader(
+        X[train_idx], y_train, bs, shuffle=True, pin_memory=pin_memory)
+    val_loader = make_supervised_loader(
+        X[val_idx], y[val_idx], bs, pin_memory=pin_memory)
+    test_loader = make_supervised_loader(
+        X_test, y_test, bs, pin_memory=pin_memory)
 
     model     = DCNN(num_classes=NUM_CLASSES, dropout=dropout).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn   = nn.CrossEntropyLoss(weight=class_weights)
+    loss_fn   = FocalLoss(gamma=2.0, weight=class_weights)
     stopper   = EarlyStopping(patience=patience, mode='max')
 
     for epoch in range(1, epochs + 1):
         # --- train ---
         model.train()
         for xb, yb in train_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            optimizer.zero_grad()
+            xb = xb.to(device, non_blocking=pin_memory)
+            yb = yb.to(device, non_blocking=pin_memory)
+            optimizer.zero_grad(set_to_none=True)
             loss_fn(model(xb), yb).backward()
             optimizer.step()
 
         # --- val macro-F1 ---
         y_vt, y_vp, _ = _infer(model, val_loader, device)
-        val_macro_f1 = f1_score(y_vt, y_vp, average='macro', zero_division=0)
+        val_macro_f1 = f1_score(
+            y_vt,
+            y_vp,
+            labels=list(range(NUM_CLASSES)),
+            average='macro',
+            zero_division=0,
+        )
         print(f'  [seed={seed}] epoch={epoch}/{epochs}  '
               f'val_macro_f1={val_macro_f1:.4f}'
               f'  (best={stopper.best:.4f}, patience={stopper.counter}/{patience})')
@@ -263,20 +246,22 @@ def main():
     cfg_train = OmegaConf.load('configs/train.yaml').train
     cfg_exp   = OmegaConf.load('configs/experiment.yaml').experiment
 
-    assert int(cfg_model.num_classes) == NUM_CLASSES, \
-        f'configs/model.yaml num_classes must be {NUM_CLASSES}, got {cfg_model.num_classes}'
+    if int(cfg_model.num_classes) != NUM_CLASSES:
+        raise ValueError(
+            f'configs/model.yaml num_classes must be {NUM_CLASSES}, '
+            f'got {cfg_model.num_classes}')
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = select_device()
     print(f'Using device: {device}')
 
-    X, y, meta = load_dataset(cfg_exp.npz_path)
-    # Ensure labels are 0-5 (multiclass); S2 uses the raw labels
-    print(f'Dataset: X={X.shape}  labels={sorted(set(y.tolist()))}')
+    X,      y,      _ = load_dataset(cfg_exp.train_npz_path)
+    X_test, y_test, _ = load_dataset(cfg_exp.test_npz_path)
+    print(f'Train: X={X.shape}  labels={sorted(set(y.tolist()))}')
+    print(f'Test:  X={X_test.shape}')
 
-    with open(cfg_exp.manifest_path) as f:
-        manifest = json.load(f)
+    manifest = load_manifest(cfg_exp.manifest_path, len(X), len(X_test))
     print(f'Manifest: train={len(manifest["train_idx"])}, '
-          f'val={len(manifest["val_idx"])}, test={len(manifest["test_idx"])}')
+          f'val={len(manifest["val_idx"])}, test(frozen)={len(manifest["test_idx"])}')
 
     seeds      = [0] if args.smoke else list(cfg_train.seeds)
     max_epochs = 1   if args.smoke else None
@@ -286,8 +271,8 @@ def main():
     all_per_class = []
     for seed in seeds:
         print(f'\n=== seed={seed} ===')
-        m = train_one_seed(seed, X, y, manifest, cfg_train, device,
-                           out_dir, max_epochs,
+        m = train_one_seed(seed, X, y, X_test, y_test, manifest, cfg_train,
+                           device, out_dir, max_epochs,
                            dropout=float(cfg_model.dropout))
         summary_rows.append({
             'seed':             m['seed'],
@@ -319,13 +304,13 @@ def main():
         df_pc = pd.concat([df_pc, pc_mean, pc_std], ignore_index=True)
 
     os.makedirs(os.path.join(out_dir, 'tables'), exist_ok=True)
-    sum_path = os.path.join(out_dir, 'tables', 's2_summary.csv')
-    pc_path  = os.path.join(out_dir, 'tables', 's2_per_class.csv')
+    sum_path = os.path.join(out_dir, 'tables', 's2_summary_focal.csv')
+    pc_path  = os.path.join(out_dir, 'tables', 's2_per_class_focal.csv')
     df_sum.to_csv(sum_path, index=False)
     df_pc.to_csv(pc_path,   index=False)
 
-    print(f'\ns2_summary.csv  → {sum_path}')
-    print(f's2_per_class.csv → {pc_path}')
+    print(f'\ns2_summary_focal.csv  → {sum_path}')
+    print(f's2_per_class_focal.csv → {pc_path}')
     print(df_sum.to_string(index=False))
 
 

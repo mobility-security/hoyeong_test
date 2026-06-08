@@ -1,4 +1,3 @@
-import torch
 import torch.nn as nn
 
 
@@ -67,6 +66,10 @@ class DCNN(nn.Module):
 
     def __init__(self, num_classes: int = 2, dropout: float = 0.5):
         super().__init__()
+        if num_classes < 2:
+            raise ValueError(f'num_classes must be at least 2, got {num_classes}')
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError(f'dropout must be in [0, 1), got {dropout}')
         self.block_a = BlockA()
         self.block_b = nn.Sequential(*[BlockB() for _ in range(5)])
         self.block_c = BlockC()
@@ -78,6 +81,8 @@ class DCNN(nn.Module):
         )
 
     def forward(self, x):
+        if x.ndim != 4 or x.shape[1] != 3:
+            raise ValueError(f'input must have shape (N,3,H,W), got {tuple(x.shape)}')
         x = self.block_a(x)
         x = self.block_b(x)
         x = self.block_c(x)
