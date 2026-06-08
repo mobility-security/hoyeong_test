@@ -10,7 +10,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 PYTHON="${ROOT}/.venv/bin/python"
-if [ ! -x "$PYTHON" ]; then
+if [ -n "${TOW_IDS_PYTHON:-}" ]; then
+    PYTHON="$TOW_IDS_PYTHON"
+elif [ ! -x "$PYTHON" ]; then
     PYTHON="python3"
 fi
 
@@ -20,6 +22,14 @@ for arg in "$@"; do
         SMOKE="--smoke"
     fi
 done
+
+if [ -n "$SMOKE" ]; then
+    export TOW_IDS_TRAIN_NPZ="data/smoke/dataset_train.npz"
+    export TOW_IDS_TEST_NPZ="data/smoke/dataset_test.npz"
+    export TOW_IDS_MANIFEST="data/smoke/split_manifest.json"
+    export TOW_IDS_OUTPUT_DIR="results/smoke"
+    export TOW_IDS_CONF_THR_ARTIFACT="results/smoke/tables/conf_threshold.json"
+fi
 
 echo "=========================================="
 echo " LOAO Experiment"
@@ -49,10 +59,11 @@ echo ""
 echo "=========================================="
 echo " All done."
 echo " Results:"
-echo "   results/tables/loao_per_fold.csv"
-echo "   results/tables/loao_summary.csv"
-echo "   results/tables/comparison_table.csv"
-echo "   results/tables/comparison_table.md"
-echo "   results/figures/loao_bar_chart.png"
-echo "   results/figures/unknown_case_4panel.png"
+OUT_DIR="${TOW_IDS_OUTPUT_DIR:-results}"
+echo "   $OUT_DIR/tables/loao_per_fold.csv"
+echo "   $OUT_DIR/tables/loao_summary.csv"
+echo "   $OUT_DIR/tables/comparison_table.csv"
+echo "   $OUT_DIR/tables/comparison_table.md"
+echo "   $OUT_DIR/figures/loao_bar_chart.png"
+echo "   $OUT_DIR/figures/unknown_case_4panel.png"
 echo "=========================================="

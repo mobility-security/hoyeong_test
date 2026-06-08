@@ -25,6 +25,7 @@ from torch.utils.data import DataLoader, TensorDataset
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from src.models.cae import CAE
 from src.train.common import EarlyStopping, load_manifest, select_device
+from src.utils.config import load_experiment_config
 from src.utils.io import load_dataset
 from src.utils.seed import set_seed
 
@@ -193,7 +194,7 @@ def main():
     args = parser.parse_args()
 
     cfg_cae = OmegaConf.load('configs/cae.yaml').cae
-    cfg_exp = OmegaConf.load('configs/experiment.yaml').experiment
+    cfg_exp = load_experiment_config()
     set_seed(42)
 
     device = select_device()

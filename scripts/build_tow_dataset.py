@@ -9,8 +9,8 @@
 파이프라인: 패킷 raw bytes → 64바이트 패딩/절단 → 연속 64패킷(stride 64, 비중첩)
             → 64x64 이미지 → /255 → 3-wavelet(coif1/db3/rbio1.3) LL → (3,32,32).
 윈도우 라벨: 윈도우 내 공격이 있으면 최빈 공격, 없으면 Normal (보안 보수적).
-pcap_id   : 연속 윈도우를 블록으로 묶은 id → train 내 val 누수 안전 분리용
-            (stride=packets 라 윈도우 간 패킷 공유 0 → guard gap 불필요).
+pcap_id   : 실제 원본 capture id. 이 스크립트는 split마다 PCAP 하나를 읽으므로 모두 0.
+packet_start/end: 각 이미지가 사용한 원본 패킷의 [start, end) 범위.
 
 사용:
     python scripts/build_tow_dataset.py            # 전체 빌드
@@ -62,10 +62,8 @@ def _load_labels(
     return y
 
 
-def build_split(pcap: Path, csv: Path, out: Path, cfg, n_blocks: int,
+def build_split(pcap: Path, csv: Path, out: Path, cfg,
                 max_packets: int | None, seed: int):
-    if n_blocks < 1:
-        raise ValueError(f'n_blocks must be positive, got {n_blocks}')
     print(f"[{out.name}] parsing {pcap.name} ...")
     frames = parse_pcap(pcap, max_packets=max_packets)
     labels = _load_labels(csv, n_expect=len(frames), max_rows=max_packets)
@@ -83,18 +81,22 @@ def build_split(pcap: Path, csv: Path, out: Path, cfg, n_blocks: int,
         raise ValueError(f'{pcap.name}: not enough packets for one image')
     X = wavelet_batch(imgs, names=("coif1", "db3", "rbio1.3"), level=cfg["level"])
 
-    # 연속 윈도우 → 블록 pcap_id (누수 안전 val 분리용)
-    actual_blocks = min(n_blocks, len(X))
-    pcap_id = (np.arange(len(X)) * actual_blocks // len(X)).astype(np.int64)
+    pcap_id = np.zeros(len(X), dtype=np.int64)
+    packet_start = np.arange(len(X), dtype=np.int64) * int(cfg['packets'])
+    packet_end = packet_start + int(cfg['packets'])
 
     meta = build_meta(X.shape[2], X.shape[3], seed=seed, git_sha=_git_sha(),
                       created_at=_dt.datetime.now().isoformat(timespec="seconds"),
                       stub=False, source=pcap.name,
+                      group_semantics='capture',
+                      packet_range_semantics='zero_based_half_open',
                       note="real TOW-IDS dataset; window label = dominant attack if any")
-    o = save_dataset(out, X, ilabels, meta, pcap_id=pcap_id)
+    o = save_dataset(
+        out, X, ilabels, meta, pcap_id=pcap_id,
+        packet_start=packet_start, packet_end=packet_end)
     counts = {LABEL_NAMES[c]: int((ilabels == c).sum()) for c in range(NUM_CLASSES)}
     print(f"  saved: {o}  (+ {o.with_suffix('.meta.json').name})")
-    print(f"  X={X.shape}  blocks={len(np.unique(pcap_id))}  window-counts={counts}\n")
+    print(f"  X={X.shape}  captures={len(np.unique(pcap_id))}  window-counts={counts}\n")
     return o
 
 
@@ -104,7 +106,6 @@ def main():
     ap.add_argument("--packets", type=int, default=64)
     ap.add_argument("--bytes", type=int, default=64)
     ap.add_argument("--level", type=int, default=1)
-    ap.add_argument("--blocks", type=int, default=150, help="train 내 val 분리용 블록 수")
     ap.add_argument("--max-packets", type=int, default=None, help="스모크용 패킷 제한")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -112,9 +113,9 @@ def main():
     out = Path(args.out_dir)
 
     build_split(TRAIN_PCAP, DS / "y_train.csv",  out / "dataset_train.npz",
-                cfg, args.blocks, args.max_packets, args.seed)
+                cfg, args.max_packets, args.seed)
     build_split(TEST_PCAP, DS / "y_test.csv", out / "dataset_test.npz",
-                cfg, args.blocks, args.max_packets, args.seed)
+                cfg, args.max_packets, args.seed)
 
 
 if __name__ == "__main__":

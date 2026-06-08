@@ -27,8 +27,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# Python 실행 파일 자동 탐지 (venv 우선)
-if [ -x "$ROOT/.venv/bin/python" ]; then
+TRAIN_NPZ="data/processed/dataset_train.npz"
+TEST_NPZ="data/processed/dataset_test.npz"
+MANIFEST="data/processed/split_manifest.json"
+OUTPUT_DIR="results"
+
+# Python 실행 파일 자동 탐지 (명시적 override → venv → system)
+if [ -n "${TOW_IDS_PYTHON:-}" ]; then
+    PY="$TOW_IDS_PYTHON"
+elif [ -x "$ROOT/.venv/bin/python" ]; then
     PY="$ROOT/.venv/bin/python"
 elif command -v python3 &>/dev/null; then
     PY="python3"
@@ -87,15 +94,9 @@ step_preprocess() {
 
     # NPZ 생성
     if [ -n "$SMOKE" ]; then
-        _warn "Smoke 모드: stub dataset 생성"
-        "$PY" scripts/make_stub_dataset.py
-        # smoke용 train/test NPZ가 없으면 stub을 복사해 임시 사용
-        if [ ! -f "data/processed/dataset_train.npz" ]; then
-            cp data/processed/dataset_v0.npz data/processed/dataset_train.npz
-        fi
-        if [ ! -f "data/processed/dataset_test.npz" ]; then
-            cp data/processed/dataset_v0.npz data/processed/dataset_test.npz
-        fi
+        _warn "Smoke 모드: 격리된 train/test stub dataset 생성"
+        "$PY" scripts/make_stub_dataset.py \
+          --out-dir data/smoke --smoke-layout --force
     else
         if [ ! -f "data/raw/y_train.csv" ] || [ ! -f "data/raw/y_test.csv" ]; then
             echo ""
@@ -107,29 +108,30 @@ step_preprocess() {
         "$PY" scripts/build_tow_dataset.py
     fi
 
-    _check_file "data/processed/dataset_train.npz"
-    _check_file "data/processed/dataset_test.npz"
+    _check_file "$TRAIN_NPZ"
+    _check_file "$TEST_NPZ"
 
     # split manifest 생성
-    _step "Split manifest 생성 (pcap_id 그룹 단위)"
+    _step "Split manifest 생성 (capture/시간 구간 누수 방지)"
     if [ -n "$SMOKE" ]; then
         "$PY" -m src.utils.split \
-          --train-npz data/processed/dataset_train.npz \
-          --test-npz  data/processed/dataset_test.npz \
-          --out       data/processed/split_manifest.json \
+          --train-npz "$TRAIN_NPZ" \
+          --test-npz  "$TEST_NPZ" \
+          --out       "$MANIFEST" \
           --val-ratio 0.10 \
           --seed 42 \
-          --allow-unsafe-fallback
+          --guard-gap-packets 0
     else
         "$PY" -m src.utils.split \
-          --train-npz data/processed/dataset_train.npz \
-          --test-npz  data/processed/dataset_test.npz \
-          --out       data/processed/split_manifest.json \
+          --train-npz "$TRAIN_NPZ" \
+          --test-npz  "$TEST_NPZ" \
+          --out       "$MANIFEST" \
           --val-ratio 0.10 \
+          --guard-gap-packets 64 \
           --seed 42
     fi
 
-    _check_file "data/processed/split_manifest.json"
+    _check_file "$MANIFEST"
     _ok "전처리 완료."
 }
 
@@ -142,17 +144,17 @@ step_train() {
 
     _step "S1 — 이진 분류 베이스라인 학습"
     "$PY" -m src.train.train_s1 $SMOKE_FLAG
-    _check_file "results/tables/s1_baseline.csv"
+    _check_file "$OUTPUT_DIR/tables/s1_baseline.csv"
 
     _step "S2 — 6-class Focal Loss 분류 학습"
     "$PY" -m src.train.train_s2 $SMOKE_FLAG
-    _check_file "results/checkpoints/s2_seed_0_best.pth"
-    _check_file "results/tables/s2_summary_focal.csv"
+    _check_file "$OUTPUT_DIR/checkpoints/s2_seed_0_best.pth"
+    _check_file "$OUTPUT_DIR/tables/s2_summary_focal.csv"
 
     _step "CAE — 정상 트래픽 재구성 + tau 산출"
     "$PY" -m src.train.train_cae $SMOKE_FLAG
-    _check_file "results/checkpoints/cae_best.pth"
-    _check_file "results/tables/tau_values.json"
+    _check_file "$OUTPUT_DIR/checkpoints/cae_best.pth"
+    _check_file "$OUTPUT_DIR/tables/tau_values.json"
 
     _ok "학습 완료."
 }
@@ -166,13 +168,13 @@ step_loao() {
 
     _step "LOAO 제로데이 평가 (5 fold × 5 seed)"
     "$PY" -m experiments.leave_one_out $SMOKE_FLAG
-    _check_file "results/tables/loao_per_fold.csv"
-    _check_file "results/tables/loao_summary.csv"
+    _check_file "$OUTPUT_DIR/tables/loao_per_fold.csv"
+    _check_file "$OUTPUT_DIR/tables/loao_summary.csv"
 
     _step "3종 비교표 생성 (S1 / S2 / S3)"
     "$PY" scripts/comparison_table.py $SMOKE_FLAG
-    _check_file "results/tables/comparison_table.csv"
-    _check_file "results/tables/comparison_table.md"
+    _check_file "$OUTPUT_DIR/tables/comparison_table.csv"
+    _check_file "$OUTPUT_DIR/tables/comparison_table.md"
 
     _ok "LOAO 완료."
 }
@@ -182,16 +184,16 @@ step_loao() {
 step_visualize() {
     _step "시각화 — LOAO bar chart"
     "$PY" scripts/plot_loao_bar.py
-    _check_file "results/figures/loao_bar_chart.png"
+    _check_file "$OUTPUT_DIR/figures/loao_bar_chart.png"
 
     _step "시각화 — Unknown case 4-panel"
     "$PY" scripts/plot_unknown_case.py
-    _check_file "results/figures/unknown_case_4panel.png"
+    _check_file "$OUTPUT_DIR/figures/unknown_case_4panel.png"
 
     _step "시각화 — S2/S3 Confusion Matrix"
     "$PY" scripts/plot_confusion_matrix.py
-    _check_file "results/figures/cm_s2_6class.png"
-    _check_file "results/figures/cm_s3_7class.png"
+    _check_file "$OUTPUT_DIR/figures/cm_s2_6class.png"
+    _check_file "$OUTPUT_DIR/figures/cm_s3_7class.png"
 
     _ok "시각화 완료."
 }
@@ -199,7 +201,7 @@ step_visualize() {
 # ── pytest ──────────────────────────────────────────────────────────────────
 
 step_test() {
-    _step "pytest — 전체 테스트 (59 tests 기대)"
+    _step "pytest — 전체 테스트"
     "$PY" -m pytest tests/ -v
     _ok "테스트 완료."
 }
@@ -215,34 +217,34 @@ _print_summary() {
     echo "============================================="
     echo ""
     echo "  [데이터]"
-    [ -f "data/processed/dataset_train.npz"    ] && _ok "data/processed/dataset_train.npz"
-    [ -f "data/processed/split_manifest.json"  ] && _ok "data/processed/split_manifest.json"
+    [ -f "$TRAIN_NPZ" ] && _ok "$TRAIN_NPZ"
+    [ -f "$MANIFEST"  ] && _ok "$MANIFEST"
     echo ""
     echo "  [체크포인트]"
-    [ -f "results/checkpoints/s2_seed_0_best.pth" ] && _ok "results/checkpoints/s2_seed_*.pth"
-    [ -f "results/checkpoints/cae_best.pth"        ] && _ok "results/checkpoints/cae_best.pth"
+    [ -f "$OUTPUT_DIR/checkpoints/s2_seed_0_best.pth" ] && _ok "$OUTPUT_DIR/checkpoints/s2_seed_*.pth"
+    [ -f "$OUTPUT_DIR/checkpoints/cae_best.pth"        ] && _ok "$OUTPUT_DIR/checkpoints/cae_best.pth"
     echo ""
     echo "  [테이블]"
     for f in \
-        results/tables/s1_baseline.csv \
-        results/tables/s2_summary_focal.csv \
-        results/tables/tau_values.json \
-        results/tables/loao_per_fold.csv \
-        results/tables/loao_summary.csv \
-        results/tables/comparison_table.csv \
-        results/tables/comparison_table.md; do
+        "$OUTPUT_DIR/tables/s1_baseline.csv" \
+        "$OUTPUT_DIR/tables/s2_summary_focal.csv" \
+        "$OUTPUT_DIR/tables/tau_values.json" \
+        "$OUTPUT_DIR/tables/loao_per_fold.csv" \
+        "$OUTPUT_DIR/tables/loao_summary.csv" \
+        "$OUTPUT_DIR/tables/comparison_table.csv" \
+        "$OUTPUT_DIR/tables/comparison_table.md"; do
         [ -f "$f" ] && _ok "$f"
     done
     echo ""
     echo "  [그림]"
     for f in \
-        results/figures/cm_s2_norm.png \
-        results/figures/cm_s2_6class.png \
-        results/figures/cm_s3_7class.png \
-        results/figures/mse_histogram.png \
-        results/figures/roc_cae.png \
-        results/figures/loao_bar_chart.png \
-        results/figures/unknown_case_4panel.png; do
+        "$OUTPUT_DIR/figures/cm_s2_norm.png" \
+        "$OUTPUT_DIR/figures/cm_s2_6class.png" \
+        "$OUTPUT_DIR/figures/cm_s3_7class.png" \
+        "$OUTPUT_DIR/figures/mse_histogram.png" \
+        "$OUTPUT_DIR/figures/roc_cae.png" \
+        "$OUTPUT_DIR/figures/loao_bar_chart.png" \
+        "$OUTPUT_DIR/figures/unknown_case_4panel.png"; do
         [ -f "$f" ] && _ok "$f"
     done
     echo ""
@@ -278,14 +280,14 @@ case "$CMD" in
             step_preprocess ""
         else
             _warn "--skip-preprocess: 전처리 건너뜀"
-            _check_file "data/processed/dataset_train.npz"
-            _check_file "data/processed/split_manifest.json"
+            _check_file "$TRAIN_NPZ"
+            _check_file "$MANIFEST"
         fi
         if [ "$SKIP_TRAIN" = false ]; then
             step_train ""
         else
             _warn "--skip-train: 학습 건너뜀"
-            _check_file "results/checkpoints/cae_best.pth"
+            _check_file "$OUTPUT_DIR/checkpoints/cae_best.pth"
         fi
         step_loao ""
         step_visualize
@@ -297,13 +299,13 @@ case "$CMD" in
         ;;
 
     train)
-        _check_file "data/processed/split_manifest.json"
+        _check_file "$MANIFEST"
         step_train ""
         ;;
 
     loao)
-        _check_file "results/checkpoints/cae_best.pth"
-        _check_file "results/checkpoints/s2_seed_0_best.pth"
+        _check_file "$OUTPUT_DIR/checkpoints/cae_best.pth"
+        _check_file "$OUTPUT_DIR/checkpoints/s2_seed_0_best.pth"
         step_loao ""
         step_visualize
         ;;
@@ -314,6 +316,15 @@ case "$CMD" in
 
     smoke)
         _step "Smoke test 시작 (1 epoch, seed 0)"
+        TRAIN_NPZ="data/smoke/dataset_train.npz"
+        TEST_NPZ="data/smoke/dataset_test.npz"
+        MANIFEST="data/smoke/split_manifest.json"
+        OUTPUT_DIR="results/smoke"
+        export TOW_IDS_TRAIN_NPZ="$TRAIN_NPZ"
+        export TOW_IDS_TEST_NPZ="$TEST_NPZ"
+        export TOW_IDS_MANIFEST="$MANIFEST"
+        export TOW_IDS_OUTPUT_DIR="$OUTPUT_DIR"
+        export TOW_IDS_CONF_THR_ARTIFACT="$OUTPUT_DIR/tables/conf_threshold.json"
         step_preprocess "smoke"
         step_train "smoke"
         step_loao "smoke"

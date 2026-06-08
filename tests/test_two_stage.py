@@ -1,4 +1,6 @@
 import unittest
+from tempfile import TemporaryDirectory
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -50,6 +52,16 @@ class TwoStageCalibrationTest(unittest.TestCase):
             self.X, self.y, torch.device('cpu'), target_fpr=0.1,
         )
         self.assertEqual(threshold, 0.0)
+
+    def test_calibration_artifact_records_manifest(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / 'threshold.json'
+            threshold = self.pipeline.calibrate_conf_thr(
+                self.X, self.y, torch.device('cpu'), target_fpr=0.5,
+                artifact_path=path, manifest_sha256='manifest-hash',
+            )
+            self.assertEqual(threshold, 0.8)
+            self.assertIn('manifest-hash', path.read_text(encoding='utf-8'))
 
     def test_cae_is_required_when_enabled(self):
         with self.assertRaises(ValueError):

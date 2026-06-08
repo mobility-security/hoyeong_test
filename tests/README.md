@@ -10,6 +10,7 @@
 | `test_two_stage.py` | PyTorch 파이프라인 threshold 보정과 배치 추론 |
 | `test_training_utils.py` | 모델 입력 검증, Focal Loss, early stopping, CAE threshold |
 | `test_loao.py` | label remap, fold 학습 및 LOAO metric |
+| `test_review_fixes.py` | smoke 경로 격리, 시간 구간 split, Unknown 지표, benchmark와 threshold artifact 회귀 검증 |
 
 저장소 루트에서 실행합니다.
 

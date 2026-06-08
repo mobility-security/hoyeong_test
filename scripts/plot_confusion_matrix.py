@@ -29,16 +29,16 @@ from src.models.cae import CAE
 from src.models.dcnn import DCNN
 from src.train.common import select_device
 from src.train.train_cae import compute_mse_batch
+from src.utils.config import load_experiment_config, resolve_conf_threshold
 from src.utils.io import LABEL_NAMES, NUM_CLASSES, load_dataset
 
 SEEDS = [0, 1, 2, 3, 4]
-CONF_THR = 0.5
 CLASS_NAMES_S2 = LABEL_NAMES                     # 6 classes
 CLASS_NAMES_S3 = LABEL_NAMES + ['Unknown']        # 7 classes
 
 
-def _load_s2(seed: int, device: torch.device) -> DCNN | None:
-    path = ROOT / 'results' / 'checkpoints' / f's2_seed_{seed}_best.pth'
+def _load_s2(seed: int, device: torch.device, output_dir: Path) -> DCNN | None:
+    path = output_dir / 'checkpoints' / f's2_seed_{seed}_best.pth'
     if not path.exists():
         return None
     ck = torch.load(path, map_location=device, weights_only=True)
@@ -47,9 +47,9 @@ def _load_s2(seed: int, device: torch.device) -> DCNN | None:
     return model.eval().to(device)
 
 
-def _load_cae(device: torch.device) -> tuple[CAE, float] | tuple[None, None]:
-    ckpt_path = ROOT / 'results' / 'checkpoints' / 'cae_best.pth'
-    tau_path = ROOT / 'results' / 'tables' / 'tau_values.json'
+def _load_cae(device: torch.device, output_dir: Path) -> tuple[CAE, float] | tuple[None, None]:
+    ckpt_path = output_dir / 'checkpoints' / 'cae_best.pth'
+    tau_path = output_dir / 'tables' / 'tau_values.json'
     if not ckpt_path.exists() or not tau_path.exists():
         return None, None
     ck = torch.load(ckpt_path, map_location=device, weights_only=True)
@@ -97,7 +97,12 @@ def _save_cm(cm: np.ndarray, class_names: list[str],
 
 def main() -> None:
     device = select_device()
-    test_npz = ROOT / 'data' / 'processed' / 'dataset_test.npz'
+    cfg_exp = load_experiment_config()
+    output_dir = Path(str(cfg_exp.output_dir))
+    test_npz = Path(str(cfg_exp.test_npz_path))
+    with Path(str(cfg_exp.manifest_path)).open(encoding='utf-8') as file:
+        manifest = json.load(file)
+    conf_thr = resolve_conf_threshold(cfg_exp, manifest)
     if not test_npz.exists():
         print(f'[ERROR] {test_npz} not found.')
         sys.exit(1)
@@ -108,7 +113,7 @@ def main() -> None:
     # --- S2: ensemble predictions across available seeds ---
     all_logits = []
     for seed in SEEDS:
-        model = _load_s2(seed, device)
+        model = _load_s2(seed, device, output_dir)
         if model is None:
             continue
         with torch.no_grad():
@@ -120,12 +125,12 @@ def main() -> None:
         y_pred_s2 = mean_logits.argmax(dim=1).numpy().astype(np.int64)
         cm_s2 = _confusion_matrix(y_test, y_pred_s2, labels=list(range(NUM_CLASSES)))
         _save_cm(cm_s2, CLASS_NAMES_S2, 'S2 (6-class DCNN)',
-                 ROOT / 'results' / 'figures' / 'cm_s2_6class.png')
+                 output_dir / 'figures' / 'cm_s2_6class.png')
     else:
         print('[WARN] No S2 checkpoints found — skipping S2 CM.')
 
     # --- S3: two-stage with CAE gate ---
-    cae, tau = _load_cae(device)
+    cae, tau = _load_cae(device, output_dir)
     if cae is None:
         print('[WARN] CAE checkpoint not found — skipping S3 CM.')
         return
@@ -146,12 +151,12 @@ def main() -> None:
         probs = F.softmax(routed_logits, dim=1).numpy()
         max_probs = probs.max(axis=1)
         y_pred_s3[routed] = probs.argmax(axis=1)
-        y_pred_s3[routed[max_probs < CONF_THR]] = UNKNOWN
+        y_pred_s3[routed[max_probs < conf_thr]] = UNKNOWN
 
     cm_s3 = _confusion_matrix(y_test, y_pred_s3, labels=list(range(NUM_CLASSES + 1)))
     # Trim zero Unknown rows/cols to keep matrix readable if no Unknowns
     _save_cm(cm_s3, CLASS_NAMES_S3, 'S3 (Two-stage: CAE+S2, 7-class)',
-             ROOT / 'results' / 'figures' / 'cm_s3_7class.png')
+             output_dir / 'figures' / 'cm_s3_7class.png')
 
 
 if __name__ == '__main__':

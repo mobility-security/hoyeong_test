@@ -20,7 +20,7 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-from src.utils.io import LABEL_NAMES, load_dataset
+from src.utils.io import LABEL_NAMES, load_dataset, load_provenance
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +181,70 @@ def leak_safe_trainval_split(
     return train_idx, val_idx
 
 
+def temporal_trainval_split(
+    packet_start: np.ndarray,
+    packet_end: np.ndarray,
+    y: np.ndarray,
+    val_ratio: float = 0.15,
+    guard_gap_packets: int = 0,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Class-covered temporal segments with packet guards on both boundaries."""
+    packet_start = np.asarray(packet_start)
+    packet_end = np.asarray(packet_end)
+    y = np.asarray(y)
+    if packet_start.ndim != 1 or packet_end.ndim != 1:
+        raise ValueError('packet_start and packet_end must be 1-D')
+    if (len(packet_start) != len(packet_end) or len(packet_start) != len(y)
+            or len(packet_start) < 2):
+        raise ValueError('temporal split requires aligned packet ranges and labels')
+    if not 0.0 < val_ratio < 1.0:
+        raise ValueError(f'val_ratio must be in (0, 1), got {val_ratio}')
+    if guard_gap_packets < 0:
+        raise ValueError(f'guard_gap_packets must be non-negative, got {guard_gap_packets}')
+    if np.any(packet_start < 0) or np.any(packet_end <= packet_start):
+        raise ValueError('invalid packet ranges')
+    if np.any(packet_start[1:] < packet_start[:-1]):
+        raise ValueError('packet ranges must be ordered for temporal splitting')
+
+    validation_parts = []
+    for label in np.unique(y):
+        label_idx = np.flatnonzero(y == label)
+        if len(label_idx) < 2:
+            raise ValueError(
+                f'class {int(label)} needs at least two samples for temporal validation')
+        n_val = min(max(int(round(len(label_idx) * val_ratio)), 1), len(label_idx) - 1)
+        validation_parts.append(label_idx[-n_val:])
+    val_idx = np.sort(np.concatenate(validation_parts).astype(np.int64))
+
+    all_idx = np.arange(len(y), dtype=np.int64)
+    train_mask = np.ones(len(y), dtype=bool)
+    train_mask[val_idx] = False
+    base_train_count = int(train_mask.sum())
+
+    segment_starts = np.r_[0, np.flatnonzero(np.diff(val_idx) > 1) + 1]
+    segment_ends = np.r_[segment_starts[1:], len(val_idx)]
+    for start_pos, end_pos in zip(segment_starts, segment_ends):
+        segment_idx = val_idx[start_pos:end_pos]
+        segment_packet_start = int(packet_start[segment_idx[0]])
+        segment_packet_end = int(packet_end[segment_idx[-1]])
+        too_close = (
+            (packet_end > segment_packet_start - guard_gap_packets)
+            & (packet_start < segment_packet_end + guard_gap_packets)
+        )
+        train_mask[too_close] = False
+    train_idx = all_idx[train_mask]
+    removed = base_train_count - len(train_idx)
+    if len(train_idx) == 0:
+        raise ValueError('guard gap removed the entire temporal training split')
+    missing_train = np.setdiff1d(np.unique(y), np.unique(y[train_idx]))
+    missing_val = np.setdiff1d(np.unique(y), np.unique(y[val_idx]))
+    if len(missing_train) or len(missing_val):
+        raise ValueError(
+            f'temporal split lost class coverage: train={missing_train.tolist()} '
+            f'val={missing_val.tolist()}')
+    return train_idx, val_idx, removed
+
+
 def normal_only_indices(y: np.ndarray) -> np.ndarray:
     """CAE 학습용 Normal(0) 샘플 인덱스."""
     y = np.asarray(y)
@@ -251,7 +315,7 @@ def make_split_manifest(
     test_npz_path: str,
     out_path: str = 'data/processed/split_manifest.json',
     val_ratio: float = 0.10,
-    guard_gap: int = 64,
+    guard_gap_packets: int = 0,
     seed: int = 42,
     allow_unsafe_fallback: bool = False,
 ) -> dict:
@@ -259,23 +323,45 @@ def make_split_manifest(
     if Path(train_npz_path).resolve() == Path(test_npz_path).resolve():
         raise ValueError('train and test datasets must be different files')
 
-    X_train, y_train, _, pcap_id = load_dataset(train_npz_path, with_pcap_id=True)
+    X_train, y_train, meta_train, pcap_id = load_dataset(
+        train_npz_path, with_pcap_id=True)
     X_test, y_test, _ = load_dataset(test_npz_path)
+    _, packet_start, packet_end = load_provenance(train_npz_path)
     n_train = len(X_train)
     n_test = len(X_test)
     print(f'[split] dataset_train N={n_train}  dataset_test N={n_test}')
-    print(f'[split] val_ratio={val_ratio}  guard_gap={guard_gap}  seed={seed}')
+    print(f'[split] val_ratio={val_ratio}  guard_gap_packets={guard_gap_packets}  seed={seed}')
 
     if pcap_id is not None:
-        train_idx_arr, val_idx_arr = leak_safe_trainval_split(
-            pcap_id, y_train, val_ratio=val_ratio, seed=seed)
-        split_strategy = 'pcap_group_stratified'
-        assert_no_group_leak(pcap_id, train_idx_arr, val_idx_arr)
+        if meta_train.get('group_semantics') != 'capture':
+            raise ValueError(
+                'pcap_id is present but metadata does not declare group_semantics=capture; '
+                'rebuild the dataset to avoid treating synthetic blocks as captures')
+        n_captures = len(np.unique(pcap_id))
+        if n_captures >= 2:
+            if guard_gap_packets:
+                raise ValueError(
+                    'guard_gap_packets is only valid for temporal single-capture splits')
+            train_idx_arr, val_idx_arr = leak_safe_trainval_split(
+                pcap_id, y_train, val_ratio=val_ratio, seed=seed)
+            split_strategy = 'capture_group_stratified'
+            assert_no_group_leak(pcap_id, train_idx_arr, val_idx_arr)
+            guard_removed_samples = 0
+        else:
+            if packet_start is None or packet_end is None:
+                raise ValueError(
+                    'single-capture datasets require packet_start/packet_end provenance')
+            train_idx_arr, val_idx_arr, guard_removed_samples = temporal_trainval_split(
+                packet_start, packet_end, y_train, val_ratio=val_ratio,
+                guard_gap_packets=guard_gap_packets)
+            split_strategy = 'temporal_segment_stratified'
     else:
         if not allow_unsafe_fallback:
             raise ValueError(
                 'pcap_id is required for leak-safe train/val splitting; '
                 'set allow_unsafe_fallback=True only for legacy smoke data')
+        if guard_gap_packets:
+            raise ValueError('guard_gap_packets requires packet provenance')
         print('[WARN] pcap_id missing; using unsafe sample-level stratified fallback')
         all_idx = np.arange(n_train)
         try:
@@ -284,6 +370,7 @@ def make_split_manifest(
         except ValueError as exc:
             raise ValueError(f'failed to create stratified train/val split: {exc}') from exc
         split_strategy = 'sample_stratified_fallback'
+        guard_removed_samples = 0
 
     train_idx = train_idx_arr.astype(np.int64).tolist()
     val_idx = val_idx_arr.astype(np.int64).tolist()
@@ -306,7 +393,8 @@ def make_split_manifest(
         'test_source': test_npz_path,
         'split_strategy': split_strategy,
         'val_ratio': val_ratio,
-        'guard_gap': guard_gap,
+        'guard_gap_packets': guard_gap_packets,
+        'guard_removed_samples': guard_removed_samples,
         'seed': seed,
         'created_at': datetime.now(timezone.utc).isoformat(),
     }
@@ -328,54 +416,6 @@ def make_split_manifest(
 
 
 # ---------------------------------------------------------------------------
-# Guard gap 적용
-# ---------------------------------------------------------------------------
-
-def _apply_guard_gap(
-    train_idx: np.ndarray,
-    val_idx: np.ndarray,
-    guard_gap: int,
-    N: int,
-) -> tuple:
-    """
-    train/val 경계 근방에서 guard_gap 개 샘플을 제거.
-    stratified split 후 인덱스 정렬 기준으로 경계를 판단.
-    guard_gap이 val 크기의 1/4을 초과하면 자동 축소.
-
-    NOTE: make_split_manifest()에서 호출하지 않음.
-    이유 ①: train/test가 dataset_train.npz / dataset_test.npz 파일 수준에서
-             이미 분리되어 있어 파일 경계가 1차 누수 방지막이다.
-    이유 ②: build_tow_dataset.py가 stride=window_size(=64)로 윈도우를 생성하므로
-             인접 윈도우 간 패킷 공유가 0이다.
-    이유 ③: sklearn stratified split으로 val 인덱스가 0..N-1 전체에 분산되므로
-             val_min≈0, val_max≈N-1이 되어 이 함수를 호출하면 train 샘플
-             대부분이 제거되는 오작동이 발생한다.
-    contiguous(시간 순서) split으로 전환할 경우에만 활성화할 것.
-    """
-    train_sorted = np.sort(train_idx)
-    val_sorted   = np.sort(val_idx)
-
-    if len(val_sorted) == 0:
-        return list(train_sorted), []
-
-    val_min = int(val_sorted[0])
-    val_max = int(val_sorted[-1])
-
-    eff_gap = min(guard_gap, len(val_sorted) // 4)
-    if eff_gap != guard_gap:
-        print(f'[WARN] guard_gap {guard_gap} → {eff_gap} (val이 너무 작음)')
-
-    # val 경계 ±eff_gap 범위의 train 샘플 제거
-    train_filtered = [
-        int(i) for i in train_sorted
-        if not (val_min - eff_gap <= i <= val_max + eff_gap)
-    ]
-    val_filtered = list(map(int, val_sorted))
-
-    return train_filtered, val_filtered
-
-
-# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -385,7 +425,8 @@ if __name__ == '__main__':
     parser.add_argument('--test-npz', default='data/processed/dataset_test.npz')
     parser.add_argument('--out', default='data/processed/split_manifest.json')
     parser.add_argument('--val-ratio', type=float, default=0.10)
-    parser.add_argument('--guard-gap', type=int, default=64)
+    parser.add_argument('--guard-gap-packets', '--guard-gap', dest='guard_gap_packets',
+                        type=int, default=0)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--allow-unsafe-fallback', action='store_true')
     args = parser.parse_args()
@@ -395,7 +436,7 @@ if __name__ == '__main__':
         test_npz_path=args.test_npz,
         out_path=args.out,
         val_ratio=args.val_ratio,
-        guard_gap=args.guard_gap,
+        guard_gap_packets=args.guard_gap_packets,
         seed=args.seed,
         allow_unsafe_fallback=args.allow_unsafe_fallback,
     )

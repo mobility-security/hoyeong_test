@@ -21,6 +21,7 @@ from sklearn.metrics import (
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from src.models.dcnn import DCNN
 from src.train.common import EarlyStopping, load_manifest, make_supervised_loader, select_device
+from src.utils.config import load_experiment_config
 from src.utils.io import load_dataset
 from src.utils.seed import set_seed
 
@@ -64,6 +65,7 @@ def train_one_seed(
     cfg_train,
     device: torch.device,
     max_epochs: int | None = None,
+    out_dir: str | None = None,
 ) -> dict:
     set_seed(seed)
 
@@ -125,6 +127,20 @@ def train_one_seed(
 
     stopper.restore_best(model)
 
+    checkpoint_path = None
+    if out_dir is not None:
+        checkpoint_dir = os.path.join(out_dir.rstrip('/'), 'checkpoints')
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        checkpoint_path = os.path.join(checkpoint_dir, f's1_seed_{seed}_best.pth')
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'num_classes': 2,
+            'dropout': 0.5,
+            'seed': seed,
+            'val_loss': float(stopper.best),
+            'input_shape': tuple(X.shape[1:]),
+        }, checkpoint_path)
+
     # test
     model.eval()
     preds, probs, trues = [], [], []
@@ -140,6 +156,7 @@ def train_one_seed(
     metrics['seed'] = seed
     metrics['val_loss_final'] = val_loss_history[-1] if val_loss_history else float('nan')
     metrics['epochs_run'] = len(val_loss_history)
+    metrics['checkpoint_path'] = checkpoint_path
     print(f'  [seed={seed}] test → acc={metrics["accuracy"]:.4f}  '
           f'f1={metrics["f1_binary"]:.4f}  fpr={metrics["fpr"]:.4f}  '
           f'fnr={metrics["fnr"]:.4f}  auc={metrics["auc_roc"]:.4f}')
@@ -157,7 +174,7 @@ def main():
     args = parser.parse_args()
 
     cfg_train = OmegaConf.load('configs/train.yaml').train
-    cfg_exp   = OmegaConf.load('configs/experiment.yaml').experiment
+    cfg_exp = load_experiment_config()
 
     device = select_device()
     print(f'Using device: {device}')
@@ -181,7 +198,8 @@ def main():
     for seed in seeds:
         print(f'\n=== seed={seed} ===')
         m = train_one_seed(seed, X, y_bin, X_test, y_test_bin,
-                           manifest, cfg_train, device, max_epochs)
+                           manifest, cfg_train, device, max_epochs,
+                           out_dir=str(cfg_exp.output_dir))
         rows.append({
             'seed':          m['seed'],
             'accuracy':      m['accuracy'],

@@ -25,21 +25,15 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-FIGURE_PATH = ROOT / 'results' / 'figures' / 'unknown_case_4panel.png'
-CAE_CKPT = ROOT / 'results' / 'checkpoints' / 'cae_best.pth'
-TRAIN_NPZ = ROOT / 'data' / 'processed' / 'dataset_train.npz'
-TAU_JSON = ROOT / 'results' / 'tables' / 'tau_values.json'
-
-
-def _load_cae_and_tau(device: torch.device):
+def _load_cae_and_tau(device: torch.device, cae_ckpt: Path, tau_json: Path):
     from src.models.cae import CAE
-    ckpt = torch.load(CAE_CKPT, map_location=device, weights_only=True)
+    ckpt = torch.load(cae_ckpt, map_location=device, weights_only=True)
     cae = CAE(input_shape=tuple(ckpt['input_shape']),
               latent_dim=int(ckpt['latent_dim']),
               noise_std=float(ckpt.get('noise_std', 0.05)))
     cae.load_state_dict(ckpt['model_state_dict'])
     cae.eval().to(device)
-    with TAU_JSON.open(encoding='utf-8') as fh:
+    with tau_json.open(encoding='utf-8') as fh:
         tau_data = json.load(fh)
     tau = float(tau_data[tau_data.get('headline_tau', 'tau_2sigma')])
     return cae, tau
@@ -52,6 +46,13 @@ def _to_rgb(x: np.ndarray) -> np.ndarray:
 
 
 def main() -> None:
+    from src.utils.config import load_experiment_config
+    cfg_exp = load_experiment_config()
+    output_dir = Path(str(cfg_exp.output_dir))
+    figure_path = output_dir / 'figures' / 'unknown_case_4panel.png'
+    cae_ckpt = output_dir / 'checkpoints' / 'cae_best.pth'
+    train_npz = Path(str(cfg_exp.train_npz_path))
+    tau_json = output_dir / 'tables' / 'tau_values.json'
     device = torch.device('cpu')
 
     # Try loading real data
@@ -62,10 +63,10 @@ def main() -> None:
     mse_normal_all = None
     mse_attack_all = None
 
-    if CAE_CKPT.exists() and TRAIN_NPZ.exists() and TAU_JSON.exists():
+    if cae_ckpt.exists() and train_npz.exists() and tau_json.exists():
         from src.utils.io import load_dataset
-        X, y, _ = load_dataset(TRAIN_NPZ)
-        cae, tau = _load_cae_and_tau(device)
+        X, y, _ = load_dataset(train_npz)
+        cae, tau = _load_cae_and_tau(device, cae_ckpt, tau_json)
 
         # Pick one F_I attack sample (label=1) and one Normal sample (label=0)
         attack_idx = np.flatnonzero(y == 1)
@@ -141,10 +142,10 @@ def main() -> None:
                  fontsize=12, y=1.01)
     plt.tight_layout()
 
-    FIGURE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(FIGURE_PATH, dpi=150, bbox_inches='tight')
+    figure_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(figure_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
-    print(f'Saved: {FIGURE_PATH}')
+    print(f'Saved: {figure_path}')
 
 
 if __name__ == '__main__':

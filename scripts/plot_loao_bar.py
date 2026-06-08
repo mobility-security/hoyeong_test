@@ -18,9 +18,6 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-SUMMARY_PATH = ROOT / 'results' / 'tables' / 'loao_summary.csv'
-FIGURE_PATH = ROOT / 'results' / 'figures' / 'loao_bar_chart.png'
-
 ATTACK_ORDER = ['F_I', 'P_I', 'M_F', 'C_D', 'C_R']
 ATTACK_LABELS = {
     'F_I': 'Frame\nInjection',
@@ -32,9 +29,14 @@ ATTACK_LABELS = {
 
 
 def main() -> None:
-    if not SUMMARY_PATH.exists():
-        print(f'[WARN] {SUMMARY_PATH} not found — generating from per-fold CSV.')
-        per_fold_path = ROOT / 'results' / 'tables' / 'loao_per_fold.csv'
+    from src.utils.config import load_experiment_config
+    cfg_exp = load_experiment_config()
+    output_dir = Path(str(cfg_exp.output_dir))
+    summary_path = output_dir / 'tables' / 'loao_summary.csv'
+    figure_path = output_dir / 'figures' / 'loao_bar_chart.png'
+    if not summary_path.exists():
+        print(f'[WARN] {summary_path} not found — generating from per-fold CSV.')
+        per_fold_path = output_dir / 'tables' / 'loao_per_fold.csv'
         if not per_fold_path.exists():
             print(f'[ERROR] {per_fold_path} not found either. Run LOAO experiment first.')
             sys.exit(1)
@@ -55,7 +57,7 @@ def main() -> None:
             })
         df = pd.DataFrame(summary_rows)
     else:
-        df = pd.read_csv(SUMMARY_PATH)
+        df = pd.read_csv(summary_path)
         df = df[df['excluded_attack'] != 'grand_mean']
 
     # Reorder to canonical attack order
@@ -112,10 +114,10 @@ def main() -> None:
                 f'{h:.2f}', ha='center', va='bottom', fontsize=8)
 
     plt.tight_layout()
-    FIGURE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(FIGURE_PATH, dpi=150, bbox_inches='tight')
+    figure_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(figure_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
-    print(f'Saved: {FIGURE_PATH}')
+    print(f'Saved: {figure_path}')
 
 
 if __name__ == '__main__':

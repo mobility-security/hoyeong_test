@@ -1,5 +1,7 @@
 data/raw/*
 !data/raw/README.md
+data/smoke/
+results/smoke/
 *.pcap
 *.npz
 npz.zip

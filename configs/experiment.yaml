@@ -4,4 +4,10 @@ experiment:
   manifest_path:  data/processed/split_manifest.json
   use_cae: false       # true → Stage 1 CAE 게이트 활성화 / false → S2 단독 모드
   conf_thr: 0.5
+  conf_thr_source: fixed   # fixed | artifact
+  conf_thr_artifact: results/tables/conf_threshold.json
+  loao_conf_thr_mode: fixed
+  benchmark_batch_size: 64
+  benchmark_warmup: 2
+  benchmark_repeats: 5
   output_dir: results/
