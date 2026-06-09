@@ -7,7 +7,7 @@ experiment:
   conf_thr_source: fixed   # fixed | artifact
   conf_thr_artifact: results/tables/conf_threshold.json
   loao_conf_thr_mode: validation   # fixed | validation
-  target_known_reject_rate: 0.05
+  target_known_reject_rate: 0.15
   benchmark_batch_size: 64
   benchmark_warmup: 2
   benchmark_repeats: 5

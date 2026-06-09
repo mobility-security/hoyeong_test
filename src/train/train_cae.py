@@ -55,8 +55,7 @@ def compute_mse_batch(model: CAE, X_arr: np.ndarray,
     for i in range(0, len(X_arr), batch_size):
         xb = torch.from_numpy(X_arr[i : i + batch_size]).to(device)
         with torch.no_grad():
-            xhat = model(xb)
-            mse  = ((xhat - xb) ** 2).mean(dim=(1, 2, 3))
+            mse = model.mse_loss(xb)
         results.extend(mse.cpu().numpy().tolist())
     return np.array(results, dtype=np.float32)
 
@@ -249,7 +248,9 @@ def main():
     input_shape = tuple(X.shape[1:])
     model = CAE(input_shape=input_shape,
                 latent_dim=int(cfg_cae.latent_dim),
-                noise_std=float(cfg_cae.noise_std)).to(device)
+                noise_std=float(cfg_cae.noise_std),
+                cae_input_size=int(cfg_cae.cae_input_size),
+                use_detail_channels=bool(cfg_cae.use_detail_channels)).to(device)
     n_params = model.n_params()
     print(f'CAE params: {n_params:,}  '
           f'({"OK < 5 M" if n_params < 5_000_000 else "WARN > 5 M"})')
@@ -272,8 +273,7 @@ def main():
         for (xb,) in train_loader:
             xb = xb.to(device)
             optimizer.zero_grad(set_to_none=True)
-            xhat = model(xb, training=True)
-            loss = ((xhat - xb) ** 2).mean(dim=(1, 2, 3)).mean()
+            loss = model.mse_loss(xb, training=True).mean()
             loss.backward()
             optimizer.step()
             tr_loss_acc += loss.item() * len(xb)
@@ -285,8 +285,7 @@ def main():
         with torch.no_grad():
             for (xb,) in val_loader:
                 xb = xb.to(device)
-                xhat = model(xb)
-                vl_loss_acc += ((xhat - xb) ** 2).mean(dim=(1, 2, 3)).mean().item() * len(xb)
+                vl_loss_acc += model.mse_loss(xb).mean().item() * len(xb)
                 vl_n        += len(xb)
         vl_loss = vl_loss_acc / max(vl_n, 1)
         scheduler.step(vl_loss)
@@ -309,6 +308,8 @@ def main():
                 'input_shape': input_shape,
                 'latent_dim':  int(cfg_cae.latent_dim),
                 'noise_std':   float(cfg_cae.noise_std),
+                'cae_input_size': int(cfg_cae.cae_input_size),
+                'use_detail_channels': bool(cfg_cae.use_detail_channels),
                 'val_loss':    stopper.best,
                 **checkpoint_provenance(
                     manifest, 'configs/cae.yaml')}, ckpt_path)

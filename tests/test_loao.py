@@ -164,11 +164,17 @@ class StubCAE(torch.nn.Module):
     def forward(self, x):
         return x  # perfect reconstruction → MSE ≈ 0
 
+    def mse_loss(self, x, training=False):
+        return torch.zeros(len(x), dtype=torch.float32)
+
 
 class HighMseCAE(torch.nn.Module):
     """Returns constant high reconstruction error."""
     def forward(self, x):
         return torch.zeros_like(x)  # MSE = mean(x^2)
+
+    def mse_loss(self, x, training=False):
+        return (x ** 2).mean(dim=(1, 2, 3))
 
 
 class FixedS2(torch.nn.Module):

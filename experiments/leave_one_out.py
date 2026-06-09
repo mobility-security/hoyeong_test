@@ -81,6 +81,8 @@ def load_cae(
         input_shape=tuple(ck['input_shape']),
         latent_dim=int(ck['latent_dim']),
         noise_std=float(ck.get('noise_std', 0.05)),
+        cae_input_size=int(ck.get('cae_input_size', 32)),
+        use_detail_channels=bool(ck.get('use_detail_channels', False)),
     )
     cae.load_state_dict(ck['model_state_dict'])
     cae.eval().to(device)
@@ -155,7 +157,7 @@ def train_s2_fold(
 
     model = DCNN(num_classes=num_classes, dropout=0.5).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = FocalLoss(gamma=2.0, weight=class_weights)
+    loss_fn = FocalLoss(gamma=3.0, weight=class_weights)
     stopper = EarlyStopping(patience=patience, mode='max')
     val_labels = sorted(np.unique(y_val).tolist())
 
