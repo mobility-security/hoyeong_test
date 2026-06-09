@@ -26,12 +26,15 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.preprocessing.imaging import frames_to_images  # noqa: E402
+from src.preprocessing.imaging import frames_to_images, window_packet_ranges  # noqa: E402
 from src.preprocessing.pcap_parser import parse_pcap  # noqa: E402
 from src.preprocessing.wavelet import wavelet_batch  # noqa: E402
-from src.utils.io import LABEL_MAP, LABEL_NAMES, NUM_CLASSES, build_meta, save_dataset  # noqa: E402
+from src.utils.io import (  # noqa: E402
+    LABEL_MAP, LABEL_NAMES, NUM_CLASSES, build_meta, save_dataset, sha256_file,
+)
 
 DS = Path("data/raw")
 TRAIN_PCAP = DS / "Automotive_Ethernet_with_Attack_original_10_17_19_50_training.pcap"
@@ -65,7 +68,10 @@ def _load_labels(
 def build_split(pcap: Path, csv: Path, out: Path, cfg,
                 max_packets: int | None, seed: int):
     print(f"[{out.name}] parsing {pcap.name} ...")
-    frames = parse_pcap(pcap, max_packets=max_packets)
+    frame_content = str(cfg['frame_content'])
+    pad_partial = str(cfg['partial_window']) == 'pad'
+    frames = parse_pcap(
+        pcap, frame_content=frame_content, max_packets=max_packets)
     labels = _load_labels(csv, n_expect=len(frames), max_rows=max_packets)
     if not frames:
         raise ValueError(f'{pcap.name}: no packets were parsed')
@@ -75,19 +81,30 @@ def build_split(pcap: Path, csv: Path, out: Path, cfg,
     imgs, ilabels, _ = frames_to_images(
         frames, labels,
         packets_per_image=cfg["packets"], bytes_per_packet=cfg["bytes"],
-        stride=cfg["packets"], group_id=0)
+        stride=cfg["stride"], group_id=0, pad_partial=pad_partial)
     print(f"  windows={len(imgs)}  wavelet(3ch) ...")
     if len(imgs) == 0:
         raise ValueError(f'{pcap.name}: not enough packets for one image')
-    X = wavelet_batch(imgs, names=("coif1", "db3", "rbio1.3"), level=cfg["level"])
+    X = wavelet_batch(
+        imgs, names=tuple(cfg['wavelets']), level=cfg["level"],
+        mode=cfg['wavelet_mode'], channel_norm=cfg['channel_norm'])
 
     pcap_id = np.zeros(len(X), dtype=np.int64)
-    packet_start = np.arange(len(X), dtype=np.int64) * int(cfg['packets'])
-    packet_end = packet_start + int(cfg['packets'])
+    packet_start, packet_end = window_packet_ranges(
+        len(frames), int(cfg['packets']), int(cfg['stride']), pad_partial)
 
-    meta = build_meta(X.shape[2], X.shape[3], seed=seed, git_sha=_git_sha(),
+    meta = build_meta(
+                      X.shape[2], X.shape[3], wavelets=tuple(cfg['wavelets']),
+                      mode=cfg['wavelet_mode'], norm=cfg['channel_norm'],
+                      seed=seed, git_sha=_git_sha(),
                       created_at=_dt.datetime.now().isoformat(timespec="seconds"),
+                      packets_per_image=cfg['packets'],
+                      bytes_per_packet=cfg['bytes'], stride=cfg['stride'],
+                      frame_content=frame_content,
+                      partial_window=str(cfg['partial_window']),
                       stub=False, source=pcap.name,
+                      source_pcap_sha256=sha256_file(pcap),
+                      source_labels_sha256=sha256_file(csv),
                       group_semantics='capture',
                       packet_range_semantics='zero_based_half_open',
                       note="real TOW-IDS dataset; window label = dominant attack if any")
@@ -102,14 +119,27 @@ def build_split(pcap: Path, csv: Path, out: Path, cfg,
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="configs/preprocess.yaml")
     ap.add_argument("--out-dir", default="data/processed")
-    ap.add_argument("--packets", type=int, default=64)
-    ap.add_argument("--bytes", type=int, default=64)
-    ap.add_argument("--level", type=int, default=1)
+    ap.add_argument("--packets", type=int, default=None)
+    ap.add_argument("--bytes", type=int, default=None)
+    ap.add_argument("--stride", type=int, default=None)
+    ap.add_argument("--level", type=int, default=None)
     ap.add_argument("--max-packets", type=int, default=None, help="스모크용 패킷 제한")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
-    cfg = {"packets": args.packets, "bytes": args.bytes, "level": args.level}
+    raw_cfg = OmegaConf.load(args.config)
+    cfg = {
+        "packets": args.packets or int(raw_cfg.imaging.packets_per_image),
+        "bytes": args.bytes or int(raw_cfg.imaging.bytes_per_packet),
+        "stride": args.stride or int(raw_cfg.imaging.stride),
+        "level": args.level or int(raw_cfg.wavelet.level),
+        "wavelets": list(raw_cfg.wavelet.names),
+        "wavelet_mode": str(raw_cfg.wavelet.mode),
+        "channel_norm": str(raw_cfg.wavelet.channel_norm),
+        "frame_content": str(raw_cfg.imaging.frame_content),
+        "partial_window": str(raw_cfg.imaging.partial_window),
+    }
     out = Path(args.out_dir)
 
     build_split(TRAIN_PCAP, DS / "y_train.csv",  out / "dataset_train.npz",

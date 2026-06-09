@@ -58,7 +58,9 @@ def test_manifest_uses_pcap_groups_and_train_only_normal_file(tmp_path):
 
     train_path = save_dataset(
         tmp_path / 'train.npz', X_train, y_train,
-        build_meta(4, 4, group_semantics='capture'), pcap_id=groups)
+        build_meta(4, 4, group_semantics='capture'), pcap_id=groups,
+        packet_start=np.tile(np.array([0, 64], dtype=np.int64), 12),
+        packet_end=np.tile(np.array([64, 128], dtype=np.int64), 12))
     test_path = save_dataset(
         tmp_path / 'test.npz', X_test, y_test, build_meta(4, 4))
     manifest_path = tmp_path / 'split_manifest.json'
@@ -89,23 +91,17 @@ def test_manifest_rejects_missing_pcap_id_by_default(tmp_path):
         make_split_manifest(str(train_path), str(test_path), str(tmp_path / 'split.json'))
 
 
-def test_temporal_split_applies_packet_guard_and_preserves_classes():
+def test_temporal_split_applies_global_packet_guard():
     packet_start = np.arange(12, dtype=np.int64) * 64
     packet_end = packet_start + 64
     y = np.repeat(np.arange(3), 4).astype(np.int64)
     train, val, removed = temporal_trainval_split(
         packet_start, packet_end, y, val_ratio=0.25, guard_gap_packets=64)
 
-    assert set(y[train]) == {0, 1, 2}
-    assert set(y[val]) == {0, 1, 2}
+    assert np.array_equal(val, np.arange(9, 12))
+    assert train.max() < val.min()
     assert removed > 0
-    for tr in train:
-        for va in val:
-            distance = max(
-                int(packet_start[va] - packet_end[tr]),
-                int(packet_start[tr] - packet_end[va]),
-            )
-            assert distance >= 64
+    assert int(packet_end[train].max()) + 64 <= int(packet_start[val].min())
 
 
 def test_compute_tau():
@@ -140,9 +136,9 @@ def test_stage2_1d_output_raises():
 
 
 def test_pipeline_normal_when_identity_scorer():
-    # IdentityScorer → 전부 score 0 <= tau → 전부 Normal
+    # CAE와 S2가 모두 Normal일 때만 Normal
     X = np.random.rand(10, 3, 32, 32).astype(np.float32)
-    stage2 = lambda x: np.tile([0.0, 0.2, 0.2, 0.2, 0.2, 0.2], (len(x), 1))
+    stage2 = lambda x: np.tile([0.9, 0.02, 0.02, 0.02, 0.02, 0.02], (len(x), 1))
     p = TwoStageIDS(IdentityScorer(), stage2, tau=0.5, conf_thr=0.5)
     assert (p.predict(X) == 0).all()
 
@@ -151,8 +147,12 @@ def test_pipeline_routes_unknown_and_attack():
     X = np.random.rand(4, 3, 32, 32).astype(np.float32)
     scorer = CallableScorer(lambda x: np.array([0.0, 0.0, 9.0, 9.0]))  # 뒤 2개만 이상
     # 이상 샘플 중 하나는 자신만만(C_D), 하나는 저신뢰(→Unknown)
-    probs = np.array([[0, 0, 0, 0, 0.95, 0.05],      # idx2: argmax=C_D(4), conf 0.95
-                      [0.2, 0.2, 0.2, 0.15, 0.15, 0.1]])  # idx3: max 0.2 < 0.5 → Unknown
+    probs = np.array([
+        [0.95, 0.01, 0.01, 0.01, 0.01, 0.01],
+        [0.95, 0.01, 0.01, 0.01, 0.01, 0.01],
+        [0, 0, 0, 0, 0.95, 0.05],
+        [0.2, 0.2, 0.2, 0.15, 0.15, 0.1],
+    ])
     stage2 = lambda x: probs
     p = TwoStageIDS(scorer, stage2, tau=1.0, conf_thr=0.5)
     out = p.predict(X)

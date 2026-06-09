@@ -14,5 +14,9 @@
 | `loao_per_fold.csv` | 공격 제외 fold와 seed별 LOAO 결과입니다. |
 | `loao_summary.csv` | 공격 클래스별 LOAO 집계 결과입니다. |
 | `comparison_table.csv`, `comparison_table.md` | S1, S2, S3 비교표입니다. |
+| `comparison_table_detailed.csv` | seed와 mean/std/95% CI 전체 행입니다. |
+| `comparison_table.tex` | 보고서용 LaTeX 표입니다. |
+| `comparison_table.provenance.json` | 데이터와 manifest 해시입니다. |
 
-CSV와 JSON을 결과의 원본으로 사용하고 Markdown은 표시용 파생 파일로 취급합니다. 각 값은 생성 스크립트와 checkpoint에 종속되므로 수동 편집보다 재실행을 우선합니다.
+이 파일들은 생성물이며 현재 저장소에는 기준 수치를 커밋하지 않습니다. 결과를 인용할
+때는 같은 디렉터리의 provenance와 checkpoint 해시를 함께 보관합니다.

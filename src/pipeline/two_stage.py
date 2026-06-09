@@ -143,19 +143,16 @@ class TwoStageIDS:
                     f'scorer scores must have shape ({n_samples},), got {scores.shape}')
             if not np.isfinite(scores).all():
                 raise ValueError('scorer produced nan or inf')
-            anomalous = scores > self.tau
+            cae_anomalous = scores > self.tau
         else:
             scores = np.full(n_samples, np.nan, dtype=np.float32)
-            anomalous = np.ones(n_samples, dtype=bool)
+            cae_anomalous = np.ones(n_samples, dtype=bool)
 
-        predicted_class = np.zeros(n_samples, dtype=np.int64)
-        max_probability = np.full(n_samples, np.nan, dtype=np.float64)
-        routed = np.flatnonzero(anomalous)
-        if len(routed):
-            probs = _validate_numpy_probabilities(
-                self.stage2_predict_proba(X[anomalous]), len(routed))
-            predicted_class[routed] = probs.argmax(axis=1)
-            max_probability[routed] = probs.max(axis=1)
+        probs = _validate_numpy_probabilities(
+            self.stage2_predict_proba(X), n_samples)
+        predicted_class = probs.argmax(axis=1).astype(np.int64)
+        max_probability = probs.max(axis=1)
+        anomalous = cae_anomalous | (predicted_class != 0)
 
         final = _route_predictions(
             anomalous, predicted_class, max_probability, self.conf_thr)
@@ -219,28 +216,25 @@ class TwoStagePipeline:
             mse_tensor = ((reconstructed - x) ** 2).mean(dim=(1, 2, 3))
             if not torch.isfinite(mse_tensor).all():
                 raise ValueError('CAE produced non-finite reconstruction scores')
-            anomalous_tensor = mse_tensor > self.tau
+            cae_anomalous_tensor = mse_tensor > self.tau
         else:
             mse_tensor = torch.full(
                 (n_samples,), float('nan'), dtype=torch.float32, device=x.device)
-            anomalous_tensor = torch.ones(n_samples, dtype=torch.bool, device=x.device)
+            cae_anomalous_tensor = torch.ones(n_samples, dtype=torch.bool, device=x.device)
 
+        logits = self.s2(x)
+        expected_shape = (n_samples, NUM_CLASSES)
+        if tuple(logits.shape) != expected_shape:
+            raise ValueError(
+                f's2 logits must have shape {expected_shape}, got {tuple(logits.shape)}')
+        if not torch.isfinite(logits).all():
+            raise ValueError('s2 model produced nan or inf logits')
+        probabilities = F.softmax(logits, dim=1)
+        max_prob_tensor, class_tensor = probabilities.max(dim=1)
+        predicted_class = class_tensor.cpu().numpy()
+        max_probability = max_prob_tensor.cpu().numpy()
+        anomalous_tensor = cae_anomalous_tensor | (class_tensor != 0)
         anomalous = anomalous_tensor.cpu().numpy()
-        predicted_class = np.zeros(n_samples, dtype=np.int64)
-        max_probability = np.full(n_samples, np.nan, dtype=np.float32)
-        routed = np.flatnonzero(anomalous)
-        if len(routed):
-            logits = self.s2(x[anomalous_tensor])
-            expected_shape = (len(routed), NUM_CLASSES)
-            if tuple(logits.shape) != expected_shape:
-                raise ValueError(
-                    f's2 logits must have shape {expected_shape}, got {tuple(logits.shape)}')
-            if not torch.isfinite(logits).all():
-                raise ValueError('s2 model produced nan or inf logits')
-            probabilities = F.softmax(logits, dim=1)
-            max_prob_tensor, class_tensor = probabilities.max(dim=1)
-            predicted_class[routed] = class_tensor.cpu().numpy()
-            max_probability[routed] = max_prob_tensor.cpu().numpy()
 
         return (
             mse_tensor.cpu().numpy(),
@@ -271,7 +265,7 @@ class TwoStagePipeline:
         device: torch.device,
         target_fpr: float = 0.05,
         artifact_path: str | Path | None = None,
-        manifest_sha256: str | None = None,
+        manifest: dict | None = None,
     ) -> float:
         """validation normal FPR 제한을 만족하는 가장 높은 confidence threshold 선택."""
         X_val = np.asarray(X_val)
@@ -306,10 +300,13 @@ class TwoStagePipeline:
             best_threshold, _ = min(results, key=lambda item: (item[1], item[0]))
         self.conf_thr = best_threshold
         if artifact_path is not None:
+            if manifest is None:
+                raise ValueError('manifest is required to persist a calibrated threshold')
             from src.utils.config import write_conf_threshold_artifact
             write_conf_threshold_artifact(
                 artifact_path, best_threshold, target_fpr,
-                manifest_sha256 or '')
+                manifest.get('sha256', ''),
+                manifest.get('train_sha256'), manifest.get('test_sha256'))
         return best_threshold
 
     @classmethod
@@ -321,6 +318,7 @@ class TwoStagePipeline:
         conf_thr: float = 0.5,
         use_cae: bool = True,
         device: torch.device = torch.device('cpu'),
+        manifest: dict | None = None,
     ):
         """검증된 state-dict checkpoint와 tau JSON으로 파이프라인 구성."""
         from src.models.cae import CAE
@@ -332,6 +330,11 @@ class TwoStagePipeline:
                 raise ValueError('cae_ckpt_path is required when use_cae=True')
             cae_checkpoint = torch.load(
                 cae_ckpt_path, map_location=device, weights_only=True)
+            if manifest is None:
+                raise ValueError('manifest is required to validate CAE checkpoint provenance')
+            from src.train.common import validate_checkpoint_provenance
+            validate_checkpoint_provenance(
+                cae_checkpoint, manifest, 'configs/cae.yaml')
             required = {'model_state_dict', 'input_shape', 'latent_dim'}
             missing = required - set(cae_checkpoint)
             if missing:
@@ -347,6 +350,12 @@ class TwoStagePipeline:
         if isinstance(s2_model, (str, Path)):
             s2_checkpoint = torch.load(
                 s2_model, map_location=device, weights_only=True)
+            if manifest is None:
+                raise ValueError('manifest is required to validate S2 checkpoint provenance')
+            from src.train.common import validate_checkpoint_provenance
+            validate_checkpoint_provenance(
+                s2_checkpoint, manifest, 'configs/model.yaml',
+                'configs/train.yaml')
             if 'model_state_dict' not in s2_checkpoint:
                 raise ValueError('S2 checkpoint missing model_state_dict')
             num_classes = int(s2_checkpoint.get('num_classes', NUM_CLASSES))
@@ -368,6 +377,11 @@ class TwoStagePipeline:
                 tau_values = json.load(file)
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(f'failed to load tau JSON {tau_json_path}: {exc}') from exc
+        if use_cae:
+            if manifest is None:
+                raise ValueError('manifest is required to validate tau provenance')
+            from src.train.common import validate_artifact_provenance
+            validate_artifact_provenance(tau_values, manifest, 'tau artifact')
         headline = tau_values.get('headline_tau', 'tau_2sigma')
         if headline not in tau_values:
             raise ValueError(f'tau JSON missing headline value: {headline}')

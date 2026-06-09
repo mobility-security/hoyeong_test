@@ -7,6 +7,8 @@ imaging:
   bytes_per_packet: 64      # 패킷 payload 를 M 바이트로 패딩/절단
   stride: 64                # 윈도우 stride (=packets_per_image → non-overlap, 누수 최소화)
   normalize: "div255"       # wavelet 이전 정규화: byte/255 → [0,1]
+  frame_content: "payload"  # payload | full_frame
+  partial_window: "pad"     # 마지막 불완전 window를 zero-padding
 
 wavelet:
   names: ["coif1", "db3", "rbio1.3"]

@@ -4,13 +4,13 @@
 
 | 파일 | 검증 범위 |
 | --- | --- |
-| `test_io.py` | NPZ schema, metadata, 저장 및 로드 오류 처리 |
+| `test_io.py` | NPZ schema v2, metadata sidecar, provenance 저장 및 변조 탐지 |
 | `test_preprocessing.py` | PCAP round-trip, 이미징, wavelet shape와 값 범위 |
 | `test_split_pipeline.py` | 그룹 누수 방지 split, manifest, 경량 2단계 라우팅 |
 | `test_two_stage.py` | PyTorch 파이프라인 threshold 보정과 배치 추론 |
 | `test_training_utils.py` | 모델 입력 검증, Focal Loss, early stopping, CAE threshold |
 | `test_loao.py` | label remap, fold 학습 및 LOAO metric |
-| `test_review_fixes.py` | smoke 경로 격리, 시간 구간 split, Unknown 지표, benchmark와 threshold artifact 회귀 검증 |
+| `test_review_fixes.py` | smoke 격리, 전역 시간 split, checkpoint/threshold provenance, benchmark 회귀 검증 |
 
 저장소 루트에서 실행합니다.
 

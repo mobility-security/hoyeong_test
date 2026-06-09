@@ -3,7 +3,7 @@ import pytest
 import torch
 
 from src.models.cae import CAE
-from src.models.dcnn import DCNN
+from src.models.dcnn import BlockB, DCNN
 from src.train.common import EarlyStopping
 from src.train.train_cae import compute_tau
 from src.utils.focal_loss import FocalLoss
@@ -20,6 +20,15 @@ def test_dcnn_validates_constructor_arguments():
         DCNN(num_classes=1)
     with pytest.raises(ValueError, match='dropout'):
         DCNN(dropout=1.0)
+
+
+def test_block_b_has_no_residual_connection():
+    block = BlockB().eval()
+    with torch.no_grad():
+        for parameter in block.parameters():
+            parameter.zero_()
+        output = block(torch.ones(1, 256, 4, 4))
+    assert torch.count_nonzero(output) == 0
 
 
 def test_focal_loss_validates_reduction():

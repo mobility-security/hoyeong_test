@@ -11,6 +11,8 @@ from src.utils.benchmark import benchmark_predict
 from src.utils.config import load_experiment_config, resolve_conf_threshold
 from src.utils.io import load_dataset
 from src.utils.split import make_split_manifest
+from src.train.common import config_sha256, load_manifest, validate_checkpoint_provenance
+from src.utils.split import compute_manifest_sha256, validate_manifest_provenance
 
 
 def test_stub_train_and_test_are_distinct_and_capture_grouped(tmp_path):
@@ -55,10 +57,12 @@ def test_single_capture_manifest_uses_temporal_guard(tmp_path):
     manifest = make_split_manifest(
         str(train_path), str(test_path), str(tmp_path / 'manifest.json'),
         val_ratio=0.2, guard_gap_packets=64)
-    assert manifest['split_strategy'] == 'temporal_segment_stratified'
+    assert manifest['split_strategy'] == 'temporal_contiguous_block'
     assert manifest['guard_removed_samples'] > 0
-    assert set(y[manifest['train_idx']]) == set(range(6))
-    assert set(y[manifest['val_idx']]) == set(range(6))
+    train_idx = np.asarray(manifest['train_idx'])
+    val_idx = np.asarray(manifest['val_idx'])
+    assert train_idx.max() < val_idx.min()
+    assert ends[train_idx].max() + 64 <= starts[val_idx].min()
 
 
 def test_s3_full_metrics_count_unknown_as_error():
@@ -93,12 +97,64 @@ def test_threshold_artifact_must_match_manifest(tmp_path):
         'conf_thr': 0.7,
         'target_fpr': 0.05,
         'manifest_sha256': 'expected',
+        'train_sha256': 'train',
+        'test_sha256': 'test',
     }), encoding='utf-8')
     cfg = {
         'conf_thr_source': 'artifact',
         'conf_thr_artifact': str(artifact),
         'output_dir': str(tmp_path),
     }
-    assert resolve_conf_threshold(cfg, {'sha256': 'expected'}) == 0.7
+    manifest = {
+        'sha256': 'expected', 'train_sha256': 'train', 'test_sha256': 'test'}
+    assert resolve_conf_threshold(cfg, manifest) == 0.7
     with pytest.raises(ValueError, match='does not match'):
-        resolve_conf_threshold(cfg, {'sha256': 'different'})
+        resolve_conf_threshold(cfg, {**manifest, 'sha256': 'different'})
+
+
+def test_checkpoint_provenance_maps_manifest_digest_key():
+    manifest = {'sha256': 'm', 'train_sha256': 'tr', 'test_sha256': 'te'}
+    checkpoint = {
+        'manifest_sha256': 'm', 'train_sha256': 'tr', 'test_sha256': 'te'}
+    validate_checkpoint_provenance(checkpoint, manifest)
+    with pytest.raises(ValueError, match='manifest_sha256'):
+        validate_checkpoint_provenance(
+            {**checkpoint, 'manifest_sha256': 'different'}, manifest)
+
+
+def test_manifest_and_dataset_tampering_are_rejected(tmp_path):
+    train = build_stub_dataset(tmp_path / 'train.npz', seed=3, n_groups=12)
+    test = build_stub_dataset(tmp_path / 'test.npz', seed=4, n_groups=12)
+    manifest_path = tmp_path / 'manifest.json'
+    manifest = make_split_manifest(str(train), str(test), str(manifest_path))
+    X_train, _, _ = load_dataset(train)
+    X_test, _, _ = load_dataset(test)
+    load_manifest(
+        manifest_path, len(X_train), len(X_test),
+        train_npz_path=train, test_npz_path=test)
+
+    tampered = {**manifest, 'seed': 999}
+    manifest_path.write_text(json.dumps(tampered), encoding='utf-8')
+    with pytest.raises(ValueError, match='SHA-256'):
+        load_manifest(
+            manifest_path, len(X_train), len(X_test),
+            train_npz_path=train, test_npz_path=test)
+
+    wrong_data_hash = {**manifest, 'train_sha256': '0' * 64}
+    wrong_data_hash['sha256'] = compute_manifest_sha256(wrong_data_hash)
+    with pytest.raises(ValueError, match='train dataset'):
+        validate_manifest_provenance(wrong_data_hash, train, test)
+
+
+def test_checkpoint_config_hash_is_enforced(tmp_path):
+    config = tmp_path / 'config.yaml'
+    config.write_text('value: 1\n', encoding='utf-8')
+    manifest = {'sha256': 'm', 'train_sha256': 'tr', 'test_sha256': 'te'}
+    checkpoint = {
+        'manifest_sha256': 'm', 'train_sha256': 'tr', 'test_sha256': 'te',
+        'config_sha256': config_sha256(config),
+    }
+    validate_checkpoint_provenance(checkpoint, manifest, config)
+    config.write_text('value: 2\n', encoding='utf-8')
+    with pytest.raises(ValueError, match='config_sha256'):
+        validate_checkpoint_provenance(checkpoint, manifest, config)

@@ -1,4 +1,5 @@
 {
+  "schema_version": 2,
   "wavelets": [
     "coif1",
     "db3",
@@ -17,9 +18,18 @@
     "C_R": 5
   },
   "seed": 0,
-  "git_sha": "2a9c487",
-  "created_at": "2026-06-07T20:51:02",
+  "git_sha": "0c93b70",
+  "created_at": "2026-06-09T11:18:12",
+  "packets_per_image": 64,
+  "bytes_per_packet": 64,
+  "stride": 64,
+  "frame_content": "payload",
+  "partial_window": "pad",
   "stub": false,
   "source": "Automotive_Ethernet_with_Attack_original_10_17_20_04_test.pcap",
+  "source_pcap_sha256": "7cf9aaf9158ae9809edac2b562fff568526151ad9eec756ee005af674a13d3ac",
+  "source_labels_sha256": "9510565cce11e28acc6c99625212f5bb0c9f001f2795576fd7a9bbe2ed5a2e06",
+  "group_semantics": "capture",
+  "packet_range_semantics": "zero_based_half_open",
   "note": "real TOW-IDS dataset; window label = dominant attack if any"
 }

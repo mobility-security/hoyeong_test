@@ -10,10 +10,11 @@
 | `run_loao.sh` | LOAO 실험, 비교표, 관련 시각화를 연속 실행합니다. |
 | `build_tow_dataset.py` | 고정된 TOW-IDS PCAP/CSV를 train/test NPZ로 변환합니다. |
 | `make_stub_dataset.py` | 실제 데이터 없이 capture provenance를 포함한 smoke test용 NPZ를 생성합니다. |
-| `comparison_table.py` | S1, S2, S3의 full/selective 지표와 반복 benchmark를 비교표로 만듭니다. |
-| `plot_confusion_matrix.py` | S2/S3 confusion matrix를 생성합니다. |
+| `validate_artifacts.py` | dataset/manifest/checkpoint/tau 해시 호환성을 검사합니다. |
+| `comparison_table.py` | 기존 checkpoint만 사용해 S1/S2/S3 지표, std, CI와 benchmark 표를 만듭니다. 누락 checkpoint를 자동 학습하지 않습니다. |
+| `plot_confusion_matrix.py` | 지정 seed를 batch 평가해 S2/S3 confusion matrix를 생성합니다. |
 | `plot_loao_bar.py` | LOAO 요약 bar chart를 생성합니다. |
-| `plot_unknown_case.py` | 대표 Unknown 사례의 4-panel 그림을 생성합니다. |
+| `plot_unknown_case.py` | 실제 held-out LOAO Unknown 샘플의 4-panel 그림을 생성합니다. |
 | `make_timeline.py` | 프로젝트 일정 그림을 생성하는 독립 유틸리티입니다. |
 
 ## 자주 쓰는 명령

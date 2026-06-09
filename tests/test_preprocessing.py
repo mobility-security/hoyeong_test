@@ -6,7 +6,9 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.preprocessing.imaging import frames_to_images, payload_to_row  # noqa: E402
+from src.preprocessing.imaging import (  # noqa: E402
+    frames_to_images, payload_to_row, window_packet_ranges,
+)
 from src.preprocessing.pcap_parser import parse_pcap, write_pcap  # noqa: E402
 from src.preprocessing.wavelet import output_hw, wavelet_3ch  # noqa: E402
 from src.utils.io import validate_schema  # noqa: E402
@@ -49,13 +51,16 @@ def test_pcap_roundtrip_and_imaging(tmp_path):
     frames = [(np.arange(80) + i).astype(np.uint8).tobytes() for i in range(200)]
     p = tmp_path / "syn.pcap"
     write_pcap(p, frames)
-    parsed = parse_pcap(p)
+    parsed = parse_pcap(p, frame_content='full_frame')
     assert len(parsed) == 200
     labels = np.full(200, 4, dtype=np.int64)  # CAN DoS
     imgs, ilabels, igroups = frames_to_images(
         parsed, labels, packets_per_image=64, bytes_per_packet=64, stride=64, group_id=7)
-    assert imgs.shape == (3, 64, 64) and imgs.max() <= 1.0
+    assert imgs.shape == (4, 64, 64) and imgs.max() <= 1.0
     assert (ilabels == 4).all() and (igroups == 7).all()
+    starts, ends = window_packet_ranges(200, 64, 64, pad_partial=True)
+    assert starts.tolist() == [0, 64, 128, 192]
+    assert ends.tolist() == [64, 128, 192, 200]
 
 
 def test_full_pipeline_to_contract(tmp_path):

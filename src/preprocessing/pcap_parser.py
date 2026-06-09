@@ -1,9 +1,6 @@
 """PCAP 파싱 (Team A / 김민세) — dpkt 기반 고속 파서.
 
-각 패킷의 raw Ethernet 프레임 바이트(헤더+payload)를 0-255 정수 시퀀스로 반환한다.
-원본 TOW-IDS 는 payload 중심이나, byte-image IDS 에서 전체 프레임 바이트 사용은
-프로토콜별 파싱(AVTP/gPTP/CAN-UDP) 취약성을 피하는 견고한 선택이다.
-필요 시 strip_l2=True 로 Ethernet 14B 헤더를 제거할 수 있다(튜닝 포인트).
+각 패킷에서 설정된 byte 영역(payload 또는 full Ethernet frame)을 반환한다.
 """
 from __future__ import annotations
 
@@ -16,12 +13,18 @@ ETH_HEADER_LEN = 14
 
 def parse_pcap(
     path: str | Path,
-    strip_l2: bool = False,
+    frame_content: str = 'payload',
     max_packets: int | None = None,
+    strip_l2: bool | None = None,
 ) -> list[bytes]:
     """pcap/pcapng → 패킷별 raw 바이트 리스트."""
     if max_packets is not None and max_packets < 0:
         raise ValueError(f'max_packets must be non-negative, got {max_packets}')
+    if strip_l2 is not None:
+        frame_content = 'l3' if strip_l2 else 'full_frame'
+    if frame_content not in {'payload', 'full_frame', 'l3'}:
+        raise ValueError(
+            f'frame_content must be payload, full_frame, or l3, got {frame_content}')
     path = Path(path)
     frames: list[bytes] = []
     try:
@@ -35,7 +38,23 @@ def parse_pcap(
                 if max_packets is not None and index >= max_packets:
                     break
                 frame = bytes(buffer)
-                frames.append(frame[ETH_HEADER_LEN:] if strip_l2 else frame)
+                if frame_content == 'full_frame':
+                    frames.append(frame)
+                    continue
+                try:
+                    ethernet = dpkt.ethernet.Ethernet(frame)
+                    layer = ethernet.data
+                    if frame_content == 'l3':
+                        frames.append(bytes(layer))
+                        continue
+                    while hasattr(layer, 'data') and not isinstance(layer, bytes):
+                        next_layer = layer.data
+                        if next_layer is layer:
+                            break
+                        layer = next_layer
+                    frames.append(bytes(layer))
+                except (ValueError, dpkt.dpkt.Error):
+                    frames.append(frame[ETH_HEADER_LEN:])
     except (OSError, ValueError, dpkt.dpkt.Error) as exc:
         raise ValueError(f'failed to parse capture {path}: {exc}') from exc
     return frames

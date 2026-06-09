@@ -58,7 +58,11 @@ class TwoStageCalibrationTest(unittest.TestCase):
             path = Path(directory) / 'threshold.json'
             threshold = self.pipeline.calibrate_conf_thr(
                 self.X, self.y, torch.device('cpu'), target_fpr=0.5,
-                artifact_path=path, manifest_sha256='manifest-hash',
+                artifact_path=path, manifest={
+                    'sha256': 'manifest-hash',
+                    'train_sha256': 'train-hash',
+                    'test_sha256': 'test-hash',
+                },
             )
             self.assertEqual(threshold, 0.8)
             self.assertIn('manifest-hash', path.read_text(encoding='utf-8'))

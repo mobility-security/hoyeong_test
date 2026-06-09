@@ -31,7 +31,7 @@ class BlockA(nn.Module):
 
 
 class BlockB(nn.Module):
-    """잔차 블록: SepConv(256→256, k=3, stride=1) → ReLU → BN + 스킵 연결(F(x)+x). ×5 반복."""
+    """TOW-IDS Block B: SepConv(256→256, k=3) → ReLU → BN. Skip 없음."""
 
     def __init__(self):
         super().__init__()
@@ -40,7 +40,7 @@ class BlockB(nn.Module):
         self.bn   = nn.BatchNorm2d(256)
 
     def forward(self, x):
-        return self.bn(self.relu(self.conv(x))) + x
+        return self.bn(self.relu(self.conv(x)))
 
 
 class BlockC(nn.Module):

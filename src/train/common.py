@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -9,7 +10,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from src.utils.split import validate_manifest_indices, validate_trainval_indices
+from src.utils.split import (
+    validate_manifest_indices,
+    validate_manifest_provenance,
+    validate_trainval_indices,
+)
 
 
 class EarlyStopping:
@@ -80,7 +85,14 @@ def select_device() -> torch.device:
     return torch.device('cpu')
 
 
-def load_manifest(path: str | Path, n_train: int, n_test: int | None = None) -> dict:
+def load_manifest(
+    path: str | Path,
+    n_train: int,
+    n_test: int | None = None,
+    *,
+    train_npz_path: str | Path | None = None,
+    test_npz_path: str | Path | None = None,
+) -> dict:
     path = Path(path)
     try:
         with path.open(encoding='utf-8') as file:
@@ -93,4 +105,71 @@ def load_manifest(path: str | Path, n_train: int, n_test: int | None = None) -> 
         validate_trainval_indices(manifest, n_train)
     else:
         validate_manifest_indices(manifest, n_train, n_test)
+    train_path = train_npz_path or manifest.get('train_source')
+    test_path = test_npz_path or manifest.get('test_source')
+    if train_path is None or test_path is None:
+        raise ValueError('dataset paths are required for manifest provenance validation')
+    validate_manifest_provenance(manifest, train_path, test_path)
     return manifest
+
+
+def config_sha256(*paths: str | Path) -> str:
+    """Hash ordered configuration files into one reproducibility identifier."""
+    digest = hashlib.sha256()
+    for path in paths:
+        path = Path(path)
+        digest.update(str(path).encode('utf-8'))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def checkpoint_provenance(manifest: dict, *config_paths: str | Path) -> dict:
+    """Build the provenance payload embedded into every model checkpoint."""
+    required = {'sha256', 'train_sha256', 'test_sha256'}
+    missing = required - set(manifest)
+    if missing:
+        raise ValueError(f'manifest missing checkpoint provenance: {sorted(missing)}')
+    return {
+        'manifest_sha256': manifest['sha256'],
+        'train_sha256': manifest['train_sha256'],
+        'test_sha256': manifest['test_sha256'],
+        'config_sha256': config_sha256(*config_paths),
+    }
+
+
+def validate_checkpoint_provenance(
+    checkpoint: dict,
+    manifest: dict,
+    *config_paths: str | Path,
+) -> None:
+    """Reject checkpoints trained against another dataset or split manifest."""
+    for artifact_key, manifest_key in (
+        ('manifest_sha256', 'sha256'),
+        ('train_sha256', 'train_sha256'),
+        ('test_sha256', 'test_sha256'),
+    ):
+        if (not checkpoint.get(artifact_key)
+                or checkpoint[artifact_key] != manifest.get(manifest_key)):
+            raise ValueError(
+                f'checkpoint {artifact_key} does not match the active manifest')
+    if config_paths:
+        expected_config_sha = config_sha256(*config_paths)
+        if checkpoint.get('config_sha256') != expected_config_sha:
+            raise ValueError('checkpoint config_sha256 does not match active configs')
+
+
+def validate_artifact_provenance(
+    artifact: dict,
+    manifest: dict,
+    artifact_name: str,
+) -> None:
+    """Validate non-checkpoint JSON/CSV sidecar provenance fields."""
+    for artifact_key, manifest_key in (
+        ('manifest_sha256', 'sha256'),
+        ('train_sha256', 'train_sha256'),
+        ('test_sha256', 'test_sha256'),
+    ):
+        if (not artifact.get(artifact_key)
+                or artifact[artifact_key] != manifest.get(manifest_key)):
+            raise ValueError(
+                f'{artifact_name} {artifact_key} does not match the active manifest')

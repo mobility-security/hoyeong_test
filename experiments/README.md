@@ -4,11 +4,15 @@
 
 ## 현재 실험
 
-`leave_one_out.py`는 공격 클래스 하나를 학습에서 제외한 뒤 해당 클래스를 미지 공격으로 평가하는 LOAO(Leave-One-Attack-Out) 실험입니다. 각 fold에서 Stage 2를 5-class로 다시 학습하고 CAE gate 및 confidence threshold를 적용합니다.
+`leave_one_out.py`는 공격 클래스 하나를 학습에서 제외한 뒤 해당 클래스를 미지 공격으로
+평가하는 LOAO 실험입니다. 각 fold/seed의 5-class checkpoint를 보존하고 MSE ROC-AUC,
+Unknown rate, known macro-F1, Normal FPR을 기록합니다. confidence threshold는 known
+validation confidence로 보정할 수 있습니다.
 
 ```bash
 python -m experiments.leave_one_out
 python -m experiments.leave_one_out --smoke
 ```
 
-결과는 기본적으로 `results/tables/loao_per_fold.csv`와 `results/tables/loao_summary.csv`에 기록됩니다. 전체 실행에는 학습된 `results/checkpoints/cae_best.pth`가 필요합니다.
+`experiment.use_cae=true`일 때는 provenance가 일치하는 CAE checkpoint가 필요합니다.
+`false`이면 CAE 없이 confidence-only fallback으로 실행됩니다.
