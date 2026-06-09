@@ -3,18 +3,18 @@
 #     아래는 팀의 명시적 "가정"이며, 팀 보유 논문 PDF Section III 확인 후 갱신.
 
 imaging:
-  packets_per_image: 64     # 연속 N개 패킷을 한 이미지로
-  bytes_per_packet: 64      # 패킷 payload 를 M 바이트로 패딩/절단
-  stride: 64                # 윈도우 stride (=packets_per_image → non-overlap, 누수 최소화)
+  packets_per_image: 128    # 연속 N개 패킷을 한 이미지로
+  bytes_per_packet: 128     # 패킷 payload 를 M 바이트로 패딩/절단
+  stride: 128               # 윈도우 stride (=packets_per_image → non-overlap, 누수 최소화)
   normalize: "div255"       # wavelet 이전 정규화: byte/255 → [0,1]
   frame_content: "payload"  # payload | full_frame
   partial_window: "pad"     # 마지막 불완전 window를 zero-padding
 
 wavelet:
   names: ["coif1", "db3", "rbio1.3"]
-  level: 1                  # ⚠️ single-level dwt2 는 H/W 를 절반으로 (64→32)
+  level: 1                  # ⚠️ single-level dwt2 는 H/W 를 절반으로 (128→64)
   mode: "periodization"
   keep: "LL"                # approximation sub-band 만 채널로 사용
   channel_norm: "minmax01"  # DWT 후 채널별 min-max → [0,1] (계약 충족)
 
-# 최종 텐서: (3, 32, 32)  =  pre-wavelet 64x64  →  level-1 dwt2  →  32x32 x3채널
+# 최종 텐서: (3, 64, 64)  =  pre-wavelet 128x128  →  level-1 dwt2  →  64x64 x3채널

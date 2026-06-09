@@ -15,9 +15,9 @@ from src.utils.io import validate_schema  # noqa: E402
 
 
 def test_wavelet_shape_and_range():
-    img = np.random.rand(64, 64).astype(np.float32)
+    img = np.random.rand(128, 128).astype(np.float32)
     out = wavelet_3ch(img, level=1)
-    assert out.shape == (3, 32, 32), out.shape          # dwt2 가 차원 반감
+    assert out.shape == (3, 64, 64), out.shape          # dwt2 가 차원 반감
     assert out.dtype == np.float32
     assert np.isfinite(out).all()
     assert out.min() >= 0.0 and out.max() <= 1.0         # 계약 [0,1]
@@ -31,7 +31,7 @@ def test_wavelet_rbio_alignment():
 
 
 def test_output_hw_matches_stub():
-    assert output_hw(64, level=1) == (32, 32)
+    assert output_hw(128, level=1) == (64, 64)
 
 
 def test_payload_pad_truncate():
