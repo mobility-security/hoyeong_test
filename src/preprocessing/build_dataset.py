@@ -21,10 +21,12 @@ import pandas as pd
 from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.preprocessing.imaging import frames_to_images  # noqa: E402
+from src.preprocessing.imaging import frames_to_images, window_packet_ranges  # noqa: E402
 from src.preprocessing.pcap_parser import parse_pcap  # noqa: E402
 from src.preprocessing.wavelet import wavelet_batch  # noqa: E402
-from src.utils.io import LABEL_MAP, LABEL_NAMES, NUM_CLASSES, build_meta, save_dataset  # noqa: E402
+from src.utils.io import (  # noqa: E402
+    LABEL_MAP, LABEL_NAMES, NUM_CLASSES, build_meta, save_dataset, sha256_file,
+)
 
 
 def _git_sha() -> str | None:
@@ -50,15 +52,23 @@ def build(manifest_csv: str, cfg, out_path: str, seed: int = 0):
         raise ValueError(f'manifest contains unknown labels: {unknown_labels}')
     img_cfg, wav_cfg = cfg.imaging, cfg.wavelet
     Xs, ys, gs, starts, ends = [], [], [], [], []
+    source_pcaps = []
     for gid, row in enumerate(df.itertuples(index=False)):
         label = LABEL_MAP[row.label_name]
-        frames = parse_pcap(row.pcap_path)
+        frame_content = str(img_cfg.frame_content)
+        pad_partial = str(img_cfg.partial_window) == 'pad'
+        frames = parse_pcap(row.pcap_path, frame_content=frame_content)
+        source_pcaps.append({
+            'path': str(row.pcap_path),
+            'sha256': sha256_file(row.pcap_path),
+        })
         labels = np.full(len(frames), label, dtype=np.int64)
         imgs, ilabels, igroups = frames_to_images(
             frames, labels,
             packets_per_image=img_cfg.packets_per_image,
             bytes_per_packet=img_cfg.bytes_per_packet,
-            stride=img_cfg.stride, group_id=gid)
+            stride=img_cfg.stride, group_id=gid,
+            pad_partial=pad_partial)
         if imgs.shape[0] == 0:
             print(f"  [warn] {row.pcap_path}: 패킷 부족 → skip")
             continue
@@ -71,9 +81,11 @@ def build(manifest_csv: str, cfg, out_path: str, seed: int = 0):
         ))
         ys.append(ilabels)
         gs.append(igroups)
-        packet_start = np.arange(len(imgs), dtype=np.int64) * int(img_cfg.stride)
+        packet_start, packet_end = window_packet_ranges(
+            len(frames), int(img_cfg.packets_per_image), int(img_cfg.stride),
+            pad_partial)
         starts.append(packet_start)
-        ends.append(packet_start + int(img_cfg.packets_per_image))
+        ends.append(packet_end)
         print(f"  {row.label_name:6s} {Path(row.pcap_path).name}: "
               f"{len(frames)} pkts → {imgs.shape[0]} imgs")
 
@@ -89,8 +101,15 @@ def build(manifest_csv: str, cfg, out_path: str, seed: int = 0):
     meta = build_meta(X.shape[2], X.shape[3], wavelets=list(wav_cfg.names),
                       mode=wav_cfg.mode, seed=seed, git_sha=_git_sha(),
                       created_at=_dt.datetime.now().isoformat(timespec="seconds"),
+                      packets_per_image=img_cfg.packets_per_image,
+                      bytes_per_packet=img_cfg.bytes_per_packet,
+                      stride=img_cfg.stride,
+                      frame_content=str(img_cfg.frame_content),
+                      partial_window=str(img_cfg.partial_window),
                       stub=False, group_semantics='capture',
-                      packet_range_semantics='zero_based_half_open')
+                      packet_range_semantics='zero_based_half_open',
+                      source_manifest_sha256=sha256_file(manifest_csv),
+                      source_pcaps=source_pcaps)
     out = save_dataset(
         out_path, X, y, meta, pcap_id=groups,
         packet_start=packet_start, packet_end=packet_end)

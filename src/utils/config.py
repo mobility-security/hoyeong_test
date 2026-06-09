@@ -25,6 +25,12 @@ def load_experiment_config(path: str | Path = 'configs/experiment.yaml'):
         value = os.environ.get(env_name)
         if value:
             cfg[key] = value
+    use_cae = os.environ.get('TOW_IDS_USE_CAE')
+    if use_cae is not None:
+        normalized = use_cae.strip().lower()
+        if normalized not in {'true', 'false', '1', '0'}:
+            raise ValueError('TOW_IDS_USE_CAE must be true/false/1/0')
+        cfg.use_cae = normalized in {'true', '1'}
     return cfg
 
 
@@ -47,11 +53,16 @@ def resolve_conf_threshold(cfg, manifest: dict | None = None) -> float:
         if 'conf_thr' not in data:
             raise ValueError(f'confidence-threshold artifact missing conf_thr: {artifact_path}')
         if manifest is not None:
-            expected = manifest.get('sha256')
-            actual = data.get('manifest_sha256')
-            if not expected or actual != expected:
-                raise ValueError(
-                    'confidence-threshold artifact does not match the active split manifest')
+            for manifest_key, artifact_key in (
+                ('sha256', 'manifest_sha256'),
+                ('train_sha256', 'train_sha256'),
+                ('test_sha256', 'test_sha256'),
+            ):
+                expected = manifest.get(manifest_key)
+                actual = data.get(artifact_key)
+                if not expected or actual != expected:
+                    raise ValueError(
+                        'confidence-threshold artifact does not match the active datasets')
         value = float(data['conf_thr'])
     else:
         raise ValueError(f'unsupported conf_thr_source: {source}')
@@ -66,6 +77,8 @@ def write_conf_threshold_artifact(
     conf_thr: float,
     target_fpr: float,
     manifest_sha256: str,
+    train_sha256: str | None = None,
+    test_sha256: str | None = None,
 ) -> Path:
     """Persist a calibrated threshold with the validation split identity."""
     conf_thr = float(conf_thr)
@@ -74,13 +87,15 @@ def write_conf_threshold_artifact(
         raise ValueError(f'conf_thr must be in [0, 1], got {conf_thr}')
     if not 0.0 <= target_fpr <= 1.0:
         raise ValueError(f'target_fpr must be in [0, 1], got {target_fpr}')
-    if not manifest_sha256:
-        raise ValueError('manifest_sha256 is required for a calibrated threshold')
+    if not manifest_sha256 or not train_sha256 or not test_sha256:
+        raise ValueError('full dataset provenance is required for a calibrated threshold')
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
         'conf_thr': conf_thr,
         'target_fpr': target_fpr,
         'manifest_sha256': manifest_sha256,
+        'train_sha256': train_sha256,
+        'test_sha256': test_sha256,
     }, indent=2), encoding='utf-8')
     return path

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -33,6 +34,8 @@ LABEL_NAMES: list[str] = list(LABEL_MAP)
 NUM_CLASSES = len(LABEL_MAP)  # 6 (학습 클래스). Unknown(6)은 추론 시점 결정.
 UNKNOWN_LABEL = NUM_CLASSES  # 6 — 2단계 파이프라인 최종 출력에서만 사용
 N_CHANNELS = 3
+DATASET_SCHEMA_VERSION = 2
+CANONICAL_WAVELETS = ["coif1", "db3", "rbio1.3"]
 
 _EPS = 1e-5
 
@@ -82,12 +85,39 @@ def validate_schema(X: np.ndarray, y: np.ndarray, meta: dict | None = None,
     if meta is not None and not isinstance(meta, Mapping):
         errs.append(f"meta must be a mapping, got {type(meta)}")
     elif meta is not None:
-        required = {"wavelets", "H", "W", "label_map"}
+        required = {
+            "schema_version", "wavelets", "H", "W", "mode", "norm",
+            "label_map", "seed", "git_sha", "created_at",
+            "packets_per_image", "bytes_per_packet", "stride",
+            "frame_content", "partial_window",
+        }
         missing = required - set(meta)
         if missing:
             errs.append(f"meta missing keys: {sorted(missing)}")
         if meta.get("label_map") not in (None, LABEL_MAP):
             errs.append("meta.label_map differs from the canonical LABEL_MAP")
+        if meta.get("schema_version") != DATASET_SCHEMA_VERSION:
+            errs.append(
+                f"meta.schema_version must be {DATASET_SCHEMA_VERSION}, "
+                f"got {meta.get('schema_version')}")
+        if meta.get("wavelets") != CANONICAL_WAVELETS:
+            errs.append(
+                f"meta.wavelets must be {CANONICAL_WAVELETS}, "
+                f"got {meta.get('wavelets')}")
+        if meta.get("mode") != "periodization":
+            errs.append(f"meta.mode must be periodization, got {meta.get('mode')}")
+        if meta.get("norm") != "minmax01":
+            errs.append(f"meta.norm must be minmax01, got {meta.get('norm')}")
+        if meta.get("frame_content") not in {"payload", "full_frame"}:
+            errs.append("meta.frame_content must be payload or full_frame")
+        if meta.get("partial_window") not in {"pad", "drop"}:
+            errs.append("meta.partial_window must be pad or drop")
+        for key in ("packets_per_image", "bytes_per_packet", "stride"):
+            try:
+                if int(meta.get(key, 0)) <= 0:
+                    errs.append(f"meta.{key} must be a positive integer")
+            except (TypeError, ValueError):
+                errs.append(f"meta.{key} must be a positive integer")
         # meta H/W 가 실제 X 공간 차원과 일치하는지 교차검증
         if isinstance(X, np.ndarray) and X.ndim == 4 and "H" in meta and "W" in meta:
             try:
@@ -108,6 +138,10 @@ def validate_schema(X: np.ndarray, y: np.ndarray, meta: dict | None = None,
             errs.append(f"pcap_id must be 1-D, got shape {pcap_id.shape}")
         elif isinstance(X, np.ndarray) and X.ndim == 4 and len(pcap_id) != len(X):
             errs.append(f"len(pcap_id)={len(pcap_id)} != len(X)={len(X)}")
+        if meta is None or meta.get("group_semantics") != "capture":
+            errs.append("pcap_id requires meta.group_semantics=capture")
+        if packet_start is None or packet_end is None:
+            errs.append("pcap_id requires packet_start and packet_end provenance")
 
     # --- packet provenance (선택, [start, end) 범위) ---
     if (packet_start is None) != (packet_end is None):
@@ -129,6 +163,13 @@ def validate_schema(X: np.ndarray, y: np.ndarray, meta: dict | None = None,
                 errs.append('packet_start must be non-negative')
             if np.any(packet_end <= packet_start):
                 errs.append('packet_end must be greater than packet_start')
+            if pcap_id is not None and isinstance(pcap_id, np.ndarray):
+                for capture_id in np.unique(pcap_id):
+                    capture_idx = np.flatnonzero(pcap_id == capture_id)
+                    starts = packet_start[capture_idx]
+                    if np.any(starts[1:] < starts[:-1]):
+                        errs.append(
+                            f'packet_start must be monotonic within capture {int(capture_id)}')
 
     if errs:
         raise SchemaError("dataset.npz 계약 위반:\n  - " + "\n  - ".join(errs))
@@ -137,9 +178,13 @@ def validate_schema(X: np.ndarray, y: np.ndarray, meta: dict | None = None,
 def build_meta(H: int, W: int, *, wavelets=("coif1", "db3", "rbio1.3"),
                mode: str = "periodization", norm: str = "minmax01",
                seed: int | None = None, git_sha: str | None = None,
-               created_at: str | None = None, **extra) -> dict:
+               created_at: str | None = None,
+               packets_per_image: int = 64, bytes_per_packet: int = 64,
+               stride: int = 64, frame_content: str = "payload",
+               partial_window: str = "pad", **extra) -> dict:
     """계약을 만족하는 meta dict 생성."""
     meta = {
+        "schema_version": DATASET_SCHEMA_VERSION,
         "wavelets": list(wavelets),
         "H": int(H),
         "W": int(W),
@@ -149,6 +194,11 @@ def build_meta(H: int, W: int, *, wavelets=("coif1", "db3", "rbio1.3"),
         "seed": seed,
         "git_sha": git_sha,
         "created_at": created_at,
+        "packets_per_image": int(packets_per_image),
+        "bytes_per_packet": int(bytes_per_packet),
+        "stride": int(stride),
+        "frame_content": frame_content,
+        "partial_window": partial_window,
     }
     meta.update(extra)
     return meta
@@ -161,6 +211,15 @@ def _json_default(o):
     if isinstance(o, np.generic):
         return o.item()
     raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+
+
+def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
+    """Return a streaming SHA-256 digest for an artifact."""
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as file:
+        while chunk := file.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def save_dataset(path: str | Path, X: np.ndarray, y: np.ndarray,
@@ -250,6 +309,13 @@ def load_dataset(path: str | Path, with_pcap_id: bool = False):
             json.JSONDecodeError) as exc:
         raise SchemaError(f"failed to load dataset {path}: {exc}") from exc
     validate_schema(X, y, meta or None, pcap_id, packet_start, packet_end)
+    sidecar_path = path.with_suffix('.meta.json')
+    try:
+        sidecar_meta = json.loads(sidecar_path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SchemaError(f'failed to load metadata sidecar {sidecar_path}: {exc}') from exc
+    if sidecar_meta != meta:
+        raise SchemaError('embedded metadata does not match the metadata sidecar')
     if with_pcap_id:
         return X, y, meta, pcap_id
     return X, y, meta

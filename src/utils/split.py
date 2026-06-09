@@ -20,7 +20,47 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-from src.utils.io import LABEL_NAMES, load_dataset, load_provenance
+from src.utils.io import LABEL_NAMES, load_dataset, load_provenance, sha256_file
+
+MANIFEST_SCHEMA_VERSION = 2
+
+
+def compute_manifest_sha256(manifest: dict) -> str:
+    """Hash manifest content while excluding the digest field itself."""
+    payload = {key: value for key, value in manifest.items() if key != 'sha256'}
+    canonical = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+
+
+def validate_manifest_provenance(
+    manifest: dict,
+    train_npz_path: str | Path,
+    test_npz_path: str | Path,
+) -> None:
+    """Verify manifest identity and the exact dataset artifacts it references."""
+    if manifest.get('schema_version') != MANIFEST_SCHEMA_VERSION:
+        raise ValueError(
+            f'split manifest schema_version must be {MANIFEST_SCHEMA_VERSION}; '
+            'rebuild the split manifest')
+    expected_sha = manifest.get('sha256')
+    actual_sha = compute_manifest_sha256(manifest)
+    if not expected_sha or expected_sha != actual_sha:
+        raise ValueError('split manifest SHA-256 verification failed')
+
+    paths = {
+        'train': Path(train_npz_path),
+        'test': Path(test_npz_path),
+    }
+    for name, path in paths.items():
+        expected = manifest.get(f'{name}_sha256')
+        if not expected or sha256_file(path) != expected:
+            raise ValueError(f'{name} dataset does not match the split manifest')
+        sidecar = path.with_suffix('.meta.json')
+        sidecar_expected = manifest.get(f'{name}_meta_sha256')
+        if not sidecar.exists() or not sidecar_expected:
+            raise ValueError(f'{name} metadata sidecar is missing from manifest provenance')
+        if sha256_file(sidecar) != sidecar_expected:
+            raise ValueError(f'{name} metadata sidecar does not match the split manifest')
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +228,7 @@ def temporal_trainval_split(
     val_ratio: float = 0.15,
     guard_gap_packets: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, int]:
-    """Class-covered temporal segments with packet guards on both boundaries."""
+    """Split one capture into globally contiguous train/validation time blocks."""
     packet_start = np.asarray(packet_start)
     packet_end = np.asarray(packet_end)
     y = np.asarray(y)
@@ -206,42 +246,19 @@ def temporal_trainval_split(
     if np.any(packet_start[1:] < packet_start[:-1]):
         raise ValueError('packet ranges must be ordered for temporal splitting')
 
-    validation_parts = []
-    for label in np.unique(y):
-        label_idx = np.flatnonzero(y == label)
-        if len(label_idx) < 2:
-            raise ValueError(
-                f'class {int(label)} needs at least two samples for temporal validation')
-        n_val = min(max(int(round(len(label_idx) * val_ratio)), 1), len(label_idx) - 1)
-        validation_parts.append(label_idx[-n_val:])
-    val_idx = np.sort(np.concatenate(validation_parts).astype(np.int64))
-
+    split_at = min(max(int(round(len(y) * (1.0 - val_ratio))), 1), len(y) - 1)
+    val_idx = np.arange(split_at, len(y), dtype=np.int64)
+    boundary = int(packet_start[split_at])
     all_idx = np.arange(len(y), dtype=np.int64)
-    train_mask = np.ones(len(y), dtype=bool)
-    train_mask[val_idx] = False
+    train_mask = np.arange(len(y)) < split_at
     base_train_count = int(train_mask.sum())
-
-    segment_starts = np.r_[0, np.flatnonzero(np.diff(val_idx) > 1) + 1]
-    segment_ends = np.r_[segment_starts[1:], len(val_idx)]
-    for start_pos, end_pos in zip(segment_starts, segment_ends):
-        segment_idx = val_idx[start_pos:end_pos]
-        segment_packet_start = int(packet_start[segment_idx[0]])
-        segment_packet_end = int(packet_end[segment_idx[-1]])
-        too_close = (
-            (packet_end > segment_packet_start - guard_gap_packets)
-            & (packet_start < segment_packet_end + guard_gap_packets)
-        )
-        train_mask[too_close] = False
+    train_mask &= packet_end <= boundary - guard_gap_packets
     train_idx = all_idx[train_mask]
     removed = base_train_count - len(train_idx)
     if len(train_idx) == 0:
         raise ValueError('guard gap removed the entire temporal training split')
-    missing_train = np.setdiff1d(np.unique(y), np.unique(y[train_idx]))
-    missing_val = np.setdiff1d(np.unique(y), np.unique(y[val_idx]))
-    if len(missing_train) or len(missing_val):
-        raise ValueError(
-            f'temporal split lost class coverage: train={missing_train.tolist()} '
-            f'val={missing_val.tolist()}')
+    if int(packet_end[train_idx].max()) + guard_gap_packets > int(packet_start[val_idx].min()):
+        raise ValueError('temporal train/validation boundary violates the packet guard')
     return train_idx, val_idx, removed
 
 
@@ -354,7 +371,7 @@ def make_split_manifest(
             train_idx_arr, val_idx_arr, guard_removed_samples = temporal_trainval_split(
                 packet_start, packet_end, y_train, val_ratio=val_ratio,
                 guard_gap_packets=guard_gap_packets)
-            split_strategy = 'temporal_segment_stratified'
+            split_strategy = 'temporal_contiguous_block'
     else:
         if not allow_unsafe_fallback:
             raise ValueError(
@@ -379,6 +396,7 @@ def make_split_manifest(
     normal_val_idx = [index for index in val_idx if y_train[index] == 0]
 
     manifest = {
+        'schema_version': MANIFEST_SCHEMA_VERSION,
         'train_idx': train_idx,
         'val_idx': val_idx,
         'test_idx': test_idx,
@@ -389,8 +407,12 @@ def make_split_manifest(
             'val': _label_counts(val_idx, y_train),
             'test': _label_counts(test_idx, y_test),
         },
-        'train_source': train_npz_path,
-        'test_source': test_npz_path,
+        'train_source': Path(train_npz_path).as_posix(),
+        'test_source': Path(test_npz_path).as_posix(),
+        'train_sha256': sha256_file(train_npz_path),
+        'test_sha256': sha256_file(test_npz_path),
+        'train_meta_sha256': sha256_file(Path(train_npz_path).with_suffix('.meta.json')),
+        'test_meta_sha256': sha256_file(Path(test_npz_path).with_suffix('.meta.json')),
         'split_strategy': split_strategy,
         'val_ratio': val_ratio,
         'guard_gap_packets': guard_gap_packets,
@@ -398,8 +420,7 @@ def make_split_manifest(
         'seed': seed,
         'created_at': datetime.now(timezone.utc).isoformat(),
     }
-    canonical = json.dumps(manifest, sort_keys=True, separators=(',', ':'))
-    manifest['sha256'] = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+    manifest['sha256'] = compute_manifest_sha256(manifest)
     validate_manifest_indices(manifest, n_train, n_test)
 
     out_path = Path(out_path)

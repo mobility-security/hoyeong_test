@@ -189,7 +189,7 @@ class TestPredictLoao:
     def _make_X(self, n=8):
         return np.ones((n, 3, 4, 4), dtype=np.float32) * 0.5
 
-    def test_stub_cae_no_anomalies(self):
+    def test_s2_recovers_attack_below_cae_threshold(self):
         cae = StubCAE()
         # MSE ≈ 0 for perfect reconstruction → all below any reasonable tau
         X = self._make_X(8)
@@ -197,8 +197,7 @@ class TestPredictLoao:
         mse, y_pred = _predict_loao(cae, FixedS2(), X, tau=0.1,
                                     conf_thr=0.5, device=torch.device('cpu'))
         assert np.all(mse == pytest.approx(0.0, abs=1e-6))
-        # Nothing is anomalous, so y_pred should all be 0 (not routed)
-        assert np.all(y_pred == 0)
+        assert np.all(y_pred == 1)
 
     def test_high_mse_cae_routes_to_s2(self):
         cae = HighMseCAE()

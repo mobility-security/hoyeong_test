@@ -1,17 +1,7 @@
-"""
-Unknown case 4-panel 시각화:
-  (a) 입력 이미지 (3채널 → RGB 합성)
-  (b) CAE 재구성 이미지
-  (c) Per-pixel 오차 heatmap
-  (d) MSE vs tau 히스토그램 (normal 저오차 vs 공격 고오차)
-
-출력: results/figures/unknown_case_4panel.png
-
-실제 dataset이 있으면 첫 번째 excluded 공격(F_I)과 Normal 샘플을 사용.
-데이터가 없으면 stub 랜덤 이미지를 사용.
-"""
+"""Visualize a real held-out LOAO sample that the pipeline predicted Unknown."""
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -20,131 +10,134 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
+import torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-def _load_cae_and_tau(device: torch.device, cae_ckpt: Path, tau_json: Path):
-    from src.models.cae import CAE
-    ckpt = torch.load(cae_ckpt, map_location=device, weights_only=True)
-    cae = CAE(input_shape=tuple(ckpt['input_shape']),
-              latent_dim=int(ckpt['latent_dim']),
-              noise_std=float(ckpt.get('noise_std', 0.05)))
-    cae.load_state_dict(ckpt['model_state_dict'])
-    cae.eval().to(device)
-    with tau_json.open(encoding='utf-8') as fh:
-        tau_data = json.load(fh)
-    tau = float(tau_data[tau_data.get('headline_tau', 'tau_2sigma')])
-    return cae, tau
+from experiments.leave_one_out import UNKNOWN_LABEL, _predict_loao, load_cae
+from src.models.dcnn import DCNN
+from src.train.common import (
+    load_manifest, select_device, validate_checkpoint_provenance,
+)
+from src.utils.config import load_experiment_config
+from src.utils.io import LABEL_MAP, LABEL_NAMES, load_dataset
 
 
 def _to_rgb(x: np.ndarray) -> np.ndarray:
-    """(3, H, W) float32 → (H, W, 3) uint8 for imshow."""
-    x = np.clip(x, 0.0, 1.0)
-    return (x.transpose(1, 2, 0) * 255).astype(np.uint8)
+    return np.clip(x, 0.0, 1.0).transpose(1, 2, 0)
 
 
 def main() -> None:
-    from src.utils.config import load_experiment_config
-    cfg_exp = load_experiment_config()
-    output_dir = Path(str(cfg_exp.output_dir))
-    figure_path = output_dir / 'figures' / 'unknown_case_4panel.png'
-    cae_ckpt = output_dir / 'checkpoints' / 'cae_best.pth'
-    train_npz = Path(str(cfg_exp.train_npz_path))
-    tau_json = output_dir / 'tables' / 'tau_values.json'
-    device = torch.device('cpu')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--attack', choices=list(LABEL_MAP)[1:], default='F_I')
+    parser.add_argument('--seed', type=int, default=0)
+    args = parser.parse_args()
 
-    # Try loading real data
-    attack_sample = None
-    normal_sample = None
-    cae = None
-    tau = 0.005
-    mse_normal_all = None
-    mse_attack_all = None
+    cfg = load_experiment_config()
+    if not bool(cfg.get('use_cae', True)):
+        raise ValueError('Unknown CAE reconstruction figure requires experiment.use_cae=true')
 
-    if cae_ckpt.exists() and train_npz.exists() and tau_json.exists():
-        from src.utils.io import load_dataset
-        X, y, _ = load_dataset(train_npz)
-        cae, tau = _load_cae_and_tau(device, cae_ckpt, tau_json)
+    output_dir = Path(str(cfg.output_dir))
+    X_train, _, _ = load_dataset(cfg.train_npz_path)
+    X_test, y_test, _ = load_dataset(cfg.test_npz_path)
+    manifest = load_manifest(
+        cfg.manifest_path, len(X_train), len(X_test),
+        train_npz_path=cfg.train_npz_path, test_npz_path=cfg.test_npz_path)
+    device = select_device()
 
-        # Pick one F_I attack sample (label=1) and one Normal sample (label=0)
-        attack_idx = np.flatnonzero(y == 1)
-        normal_idx = np.flatnonzero(y == 0)
-        if len(attack_idx) and len(normal_idx):
-            rng = np.random.default_rng(42)
-            attack_sample = X[rng.choice(attack_idx)]    # (3,H,W)
-            normal_sample = X[rng.choice(normal_idx[:100])]  # (3,H,W)
+    cae, tau = load_cae(output_dir / 'checkpoints' / 'cae_best.pth', device, manifest)
+    s2_path = (output_dir / 'checkpoints' / 'loao'
+               / f'exclude_{args.attack}_seed_{args.seed}.pth')
+    checkpoint = torch.load(s2_path, map_location=device, weights_only=True)
+    validate_checkpoint_provenance(
+        checkpoint, manifest, 'configs/model.yaml', 'configs/train.yaml')
+    if checkpoint.get('excluded_attack') != args.attack:
+        raise ValueError('LOAO checkpoint excluded class does not match the requested attack')
+    s2 = DCNN(
+        num_classes=int(checkpoint['num_classes']),
+        dropout=float(checkpoint.get('dropout', 0.5)),
+    ).to(device)
+    s2.load_state_dict(checkpoint['model_state_dict'])
+    s2.eval()
 
-            # MSE distribution for histogram (small random subset for speed)
-            n_sub = min(300, len(attack_idx), len(normal_idx))
-            sub_atk = X[rng.choice(attack_idx, n_sub, replace=False)]
-            sub_nrm = X[rng.choice(normal_idx, n_sub, replace=False)]
-            from src.train.train_cae import compute_mse_batch
-            mse_attack_all = compute_mse_batch(cae, sub_atk, device)
-            mse_normal_all = compute_mse_batch(cae, sub_nrm, device)
+    rows = pd.read_csv(output_dir / 'tables' / 'loao_per_fold.csv')
+    selected_row = rows[
+        (rows['excluded_attack'] == args.attack) & (rows['seed'] == args.seed)]
+    if selected_row.empty:
+        raise ValueError('LOAO result row is missing for the requested fold/seed')
+    conf_thr = float(selected_row.iloc[0]['conf_thr'])
 
-    if attack_sample is None:
-        # Stub data
-        rng = np.random.default_rng(0)
-        attack_sample = rng.random((3, 32, 32)).astype(np.float32)
-        normal_sample = rng.random((3, 32, 32)).astype(np.float32) * 0.1
-        mse_attack_all = np.abs(rng.standard_normal(100)).astype(np.float32) * 0.01 + 0.008
-        mse_normal_all = np.abs(rng.standard_normal(100)).astype(np.float32) * 0.001 + 0.001
+    attack_id = LABEL_MAP[args.attack]
+    attack_indices = np.flatnonzero(y_test == attack_id)
+    if len(attack_indices) == 0:
+        raise ValueError(f'test dataset has no {args.attack} samples')
+    X_attack = X_test[attack_indices]
+    mse, predictions = _predict_loao(
+        cae, s2, X_attack, tau, conf_thr, device, use_cae=True)
+    unknown_local = np.flatnonzero(predictions == UNKNOWN_LABEL)
+    if len(unknown_local) == 0:
+        raise ValueError(
+            f'fold {args.attack}/seed {args.seed} produced no actual Unknown sample')
 
-    # Reconstruct via CAE
-    if cae is not None:
-        with torch.no_grad():
-            x_in = torch.from_numpy(attack_sample[None]).to(device)
-            x_rec = cae(x_in)[0].cpu().numpy()
-    else:
-        x_rec = attack_sample * 0.5  # stub
+    local_index = int(unknown_local[np.argmax(mse[unknown_local])])
+    dataset_index = int(attack_indices[local_index])
+    sample = X_attack[local_index]
+    with torch.no_grad():
+        tensor = torch.from_numpy(sample[None]).to(device)
+        reconstruction = cae(tensor)[0].cpu().numpy()
+        probabilities = F.softmax(s2(tensor), dim=1)[0].cpu().numpy()
 
-    err_map = np.abs(x_rec - attack_sample).mean(axis=0)  # (H, W)
-    mse_attack_val = float(((x_rec - attack_sample) ** 2).mean())
+    squared_error = ((reconstruction - sample) ** 2).mean(axis=0)
+    max_probability = float(probabilities.max())
+    known_names = [name for name in LABEL_NAMES if name != args.attack]
 
-    # 4-panel figure
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-
-    # (a) Input
-    axes[0].imshow(_to_rgb(attack_sample))
-    axes[0].set_title('(a) Input (F_I attack)', fontsize=11)
+    fig, axes = plt.subplots(1, 4, figsize=(17, 4))
+    axes[0].imshow(_to_rgb(sample))
+    axes[0].set_title(f'(a) Held-out {args.attack} input')
     axes[0].axis('off')
 
-    # (b) CAE reconstruction
-    axes[1].imshow(_to_rgb(x_rec))
-    axes[1].set_title('(b) CAE Reconstruction', fontsize=11)
+    axes[1].imshow(_to_rgb(reconstruction))
+    axes[1].set_title('(b) CAE reconstruction')
     axes[1].axis('off')
 
-    # (c) Per-pixel error heatmap
-    im = axes[2].imshow(err_map, cmap='hot', vmin=0)
-    axes[2].set_title('(c) Per-Pixel Error', fontsize=11)
+    image = axes[2].imshow(squared_error, cmap='hot', vmin=0)
+    axes[2].set_title(f'(c) Squared error\nMSE={mse[local_index]:.5f}, tau={tau:.5f}')
     axes[2].axis('off')
-    plt.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
+    fig.colorbar(image, ax=axes[2], fraction=0.046, pad=0.04)
 
-    # (d) MSE histogram: Normal vs Attack vs tau
-    bins = np.linspace(
-        0,
-        max(float(np.percentile(mse_attack_all, 99)) * 1.2, tau * 3),
-        50,
-    )
-    axes[3].hist(mse_normal_all, bins=bins, alpha=0.7, label='Normal', color='steelblue')
-    axes[3].hist(mse_attack_all, bins=bins, alpha=0.7, label='F_I Attack', color='tomato')
-    axes[3].axvline(tau, color='red', lw=2, ls='--', label=f'τ={tau:.4f}')
-    axes[3].axvline(mse_attack_val, color='orange', lw=1.5, ls=':',
-                    label=f'This sample MSE={mse_attack_val:.4f}')
-    axes[3].set_xlabel('Reconstruction MSE', fontsize=10)
-    axes[3].set_ylabel('Count', fontsize=10)
-    axes[3].set_title('(d) MSE Distribution', fontsize=11)
+    axes[3].bar(known_names, probabilities, color='#4C78A8')
+    axes[3].axhline(conf_thr, color='red', linestyle='--',
+                    label=f'Unknown threshold={conf_thr:.3f}')
+    axes[3].set_ylim(0, 1)
+    axes[3].tick_params(axis='x', rotation=45)
+    axes[3].set_ylabel('Softmax confidence')
+    axes[3].set_title(f'(d) S2 confidence\nmax={max_probability:.3f} -> Unknown')
     axes[3].legend(fontsize=8)
 
-    plt.suptitle('Unknown Case Analysis — Excluded Attack: F_I (Frame Injection)',
-                 fontsize=12, y=1.01)
-    plt.tight_layout()
-
+    fig.suptitle(
+        f'Actual LOAO Unknown case: exclude={args.attack}, seed={args.seed}, '
+        f'test_index={dataset_index}')
+    fig.tight_layout()
+    figure_path = output_dir / 'figures' / 'unknown_case_4panel.png'
     figure_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(figure_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
+
+    figure_path.with_suffix('.json').write_text(json.dumps({
+        'excluded_attack': args.attack,
+        'seed': args.seed,
+        'test_index': dataset_index,
+        'prediction': 'Unknown',
+        'mse': float(mse[local_index]),
+        'tau': tau,
+        'max_probability': max_probability,
+        'conf_thr': conf_thr,
+        'manifest_sha256': manifest['sha256'],
+        'checkpoint_path': str(s2_path),
+    }, indent=2), encoding='utf-8')
     print(f'Saved: {figure_path}')
 
 

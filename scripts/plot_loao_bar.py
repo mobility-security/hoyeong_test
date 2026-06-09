@@ -48,8 +48,7 @@ def main() -> None:
                 continue
             summary_rows.append({
                 'excluded_attack': atk,
-                'cae_recall_mean': sub['cae_anomaly_recall'].mean(),
-                'cae_recall_std': sub['cae_anomaly_recall'].std(),
+                'cae_recall': sub['cae_anomaly_recall'].iloc[0],
                 'unknown_rate_mean': sub['unknown_rate'].mean(),
                 'unknown_rate_std': sub['unknown_rate'].std(),
                 'normal_fpr_mean': sub['normal_fpr'].mean(),
@@ -57,8 +56,9 @@ def main() -> None:
             })
         df = pd.DataFrame(summary_rows)
     else:
-        df = pd.read_csv(summary_path)
-        df = df[df['excluded_attack'] != 'grand_mean']
+        full_summary = pd.read_csv(summary_path)
+        grand_row = full_summary[full_summary['excluded_attack'] == 'grand_mean']
+        df = full_summary[full_summary['excluded_attack'] != 'grand_mean'].copy()
 
     # Reorder to canonical attack order
     df['_order'] = df['excluded_attack'].map({a: i for i, a in enumerate(ATTACK_ORDER)})
@@ -70,19 +70,19 @@ def main() -> None:
 
     fig, ax = plt.subplots(figsize=(9, 5))
 
-    bars1 = ax.bar(
-        x - width / 2,
-        df['cae_recall_mean'],
-        width,
-        yerr=df['cae_recall_std'],
-        label='CAE Anomaly Recall',
-        color='#2196F3',
-        alpha=0.85,
-        capsize=5,
-        error_kw={'linewidth': 1.5},
-    )
+    has_cae = 'cae_recall' in df and df['cae_recall'].notna().any()
+    if has_cae:
+        bars1 = ax.bar(
+            x - width / 2, df['cae_recall'], width,
+            label='CAE Anomaly Recall (one value per fold)',
+            color='#2196F3', alpha=0.85,
+        )
+        unknown_x = x + width / 2
+    else:
+        bars1 = []
+        unknown_x = x
     bars2 = ax.bar(
-        x + width / 2,
+        unknown_x,
         df['unknown_rate_mean'],
         width,
         yerr=df['unknown_rate_std'],
@@ -95,13 +95,22 @@ def main() -> None:
 
     ax.set_xlabel('Excluded Attack Class', fontsize=12)
     ax.set_ylabel('Detection Rate', fontsize=12)
-    ax.set_title('LOAO Zero-Day Detection (5-fold × 5-seed)', fontsize=13)
+    per_fold_path = output_dir / 'tables' / 'loao_per_fold.csv'
+    raw = pd.read_csv(per_fold_path) if per_fold_path.exists() else None
+    n_folds = int(raw['excluded_attack'].nunique()) if raw is not None else len(df)
+    n_seeds = int(raw.groupby('excluded_attack')['seed'].nunique().max()) if raw is not None else 0
+    ax.set_title(f'LOAO Zero-Day Detection ({n_folds}-fold x {n_seeds}-seed)', fontsize=13)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=10)
     ax.set_ylim(0, 1.05)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f'{v:.0%}'))
     ax.legend(fontsize=10)
     ax.grid(axis='y', alpha=0.3)
+    if 'grand_row' in locals() and not grand_row.empty:
+        grand_unknown = float(grand_row['unknown_rate_mean'].iloc[0])
+        ax.axhline(grand_unknown, color='#FF5722', linestyle=':', linewidth=1.5,
+                   label=f'Grand Unknown mean={grand_unknown:.3f}')
+        ax.legend(fontsize=9)
 
     # Value labels on bars
     for bar in bars1:

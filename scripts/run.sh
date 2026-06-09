@@ -20,6 +20,11 @@
 # =============================================================================
 
 set -euo pipefail
+export PYTHONHASHSEED="${PYTHONHASHSEED:-0}"
+export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-${TMPDIR:-/tmp}/ms-test-matplotlib}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${TMPDIR:-/tmp}/ms-test-cache}"
+mkdir -p "$MPLCONFIGDIR" "$XDG_CACHE_HOME"
 
 # ---------------------------------------------------------------------------
 # 경로 설정
@@ -27,10 +32,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-TRAIN_NPZ="data/processed/dataset_train.npz"
-TEST_NPZ="data/processed/dataset_test.npz"
-MANIFEST="data/processed/split_manifest.json"
-OUTPUT_DIR="results"
+TRAIN_NPZ="${TOW_IDS_TRAIN_NPZ:-data/processed/dataset_train.npz}"
+TEST_NPZ="${TOW_IDS_TEST_NPZ:-data/processed/dataset_test.npz}"
+MANIFEST="${TOW_IDS_MANIFEST:-data/processed/split_manifest.json}"
+OUTPUT_DIR="${TOW_IDS_OUTPUT_DIR:-results}"
 
 # Python 실행 파일 자동 탐지 (명시적 override → venv → system)
 if [ -n "${TOW_IDS_PYTHON:-}" ]; then
@@ -79,6 +84,18 @@ _check_dir_nonempty() {
         echo "  [FAIL] 체크포인트 없음: $1"
         exit 1
     fi
+}
+
+_use_cae() {
+    "$PY" -c 'from src.utils.config import load_experiment_config; print("true" if bool(load_experiment_config().use_cae) else "false")'
+}
+
+_validate_data_contract() {
+    "$PY" -c 'from src.utils.config import load_experiment_config; from src.utils.io import load_dataset; from src.train.common import load_manifest; c=load_experiment_config(); xt,_,_=load_dataset(c.train_npz_path); xv,_,_=load_dataset(c.test_npz_path); load_manifest(c.manifest_path,len(xt),len(xv),train_npz_path=c.train_npz_path,test_npz_path=c.test_npz_path); print("  [OK] dataset/manifest provenance")'
+}
+
+_check_training_artifacts() {
+    "$PY" scripts/validate_artifacts.py
 }
 
 # ---------------------------------------------------------------------------
@@ -151,10 +168,14 @@ step_train() {
     _check_file "$OUTPUT_DIR/checkpoints/s2_seed_0_best.pth"
     _check_file "$OUTPUT_DIR/tables/s2_summary_focal.csv"
 
-    _step "CAE — 정상 트래픽 재구성 + tau 산출"
-    "$PY" -m src.train.train_cae $SMOKE_FLAG
-    _check_file "$OUTPUT_DIR/checkpoints/cae_best.pth"
-    _check_file "$OUTPUT_DIR/tables/tau_values.json"
+    if [ "$(_use_cae)" = "true" ]; then
+        _step "CAE — 정상 트래픽 재구성 + tau 산출"
+        "$PY" -m src.train.train_cae $SMOKE_FLAG
+        _check_file "$OUTPUT_DIR/checkpoints/cae_best.pth"
+        _check_file "$OUTPUT_DIR/tables/tau_values.json"
+    else
+        _warn "experiment.use_cae=false: CAE 학습을 건너뜀"
+    fi
 
     _ok "학습 완료."
 }
@@ -171,7 +192,7 @@ step_loao() {
     _check_file "$OUTPUT_DIR/tables/loao_per_fold.csv"
     _check_file "$OUTPUT_DIR/tables/loao_summary.csv"
 
-    _step "3종 비교표 생성 (S1 / S2 / S3)"
+    _step "비교표 생성 (활성화된 S1 / S2 / S3)"
     "$PY" scripts/comparison_table.py $SMOKE_FLAG
     _check_file "$OUTPUT_DIR/tables/comparison_table.csv"
     _check_file "$OUTPUT_DIR/tables/comparison_table.md"
@@ -186,14 +207,20 @@ step_visualize() {
     "$PY" scripts/plot_loao_bar.py
     _check_file "$OUTPUT_DIR/figures/loao_bar_chart.png"
 
-    _step "시각화 — Unknown case 4-panel"
-    "$PY" scripts/plot_unknown_case.py
-    _check_file "$OUTPUT_DIR/figures/unknown_case_4panel.png"
+    if [ "$(_use_cae)" = "true" ]; then
+        _step "시각화 — Unknown case 4-panel"
+        "$PY" scripts/plot_unknown_case.py
+        _check_file "$OUTPUT_DIR/figures/unknown_case_4panel.png"
+    else
+        _warn "experiment.use_cae=false: CAE Unknown 사례 그림을 건너뜀"
+    fi
 
     _step "시각화 — S2/S3 Confusion Matrix"
     "$PY" scripts/plot_confusion_matrix.py
     _check_file "$OUTPUT_DIR/figures/cm_s2_6class.png"
-    _check_file "$OUTPUT_DIR/figures/cm_s3_7class.png"
+    if [ "$(_use_cae)" = "true" ]; then
+        _check_file "$OUTPUT_DIR/figures/cm_s3_7class.png"
+    fi
 
     _ok "시각화 완료."
 }
@@ -282,15 +309,17 @@ case "$CMD" in
             _warn "--skip-preprocess: 전처리 건너뜀"
             _check_file "$TRAIN_NPZ"
             _check_file "$MANIFEST"
+            _validate_data_contract
         fi
         if [ "$SKIP_TRAIN" = false ]; then
             step_train ""
         else
             _warn "--skip-train: 학습 건너뜀"
-            _check_file "$OUTPUT_DIR/checkpoints/cae_best.pth"
+            _check_training_artifacts
         fi
         step_loao ""
         step_visualize
+        step_test
         _print_summary
         ;;
 
@@ -304,8 +333,7 @@ case "$CMD" in
         ;;
 
     loao)
-        _check_file "$OUTPUT_DIR/checkpoints/cae_best.pth"
-        _check_file "$OUTPUT_DIR/checkpoints/s2_seed_0_best.pth"
+        _check_training_artifacts
         step_loao ""
         step_visualize
         ;;
@@ -325,6 +353,7 @@ case "$CMD" in
         export TOW_IDS_MANIFEST="$MANIFEST"
         export TOW_IDS_OUTPUT_DIR="$OUTPUT_DIR"
         export TOW_IDS_CONF_THR_ARTIFACT="$OUTPUT_DIR/tables/conf_threshold.json"
+        export TOW_IDS_USE_CAE=true
         step_preprocess "smoke"
         step_train "smoke"
         step_loao "smoke"

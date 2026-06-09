@@ -24,7 +24,9 @@ from torch.utils.data import DataLoader, TensorDataset
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from src.models.cae import CAE
-from src.train.common import EarlyStopping, load_manifest, select_device
+from src.train.common import (
+    EarlyStopping, checkpoint_provenance, load_manifest, select_device,
+)
 from src.utils.config import load_experiment_config
 from src.utils.io import load_dataset
 from src.utils.seed import set_seed
@@ -203,7 +205,10 @@ def main():
     # ---- Load data + manifest ----
     # CAE는 train 데이터만 사용 (test는 절대 사용 금지)
     X, y, _ = load_dataset(cfg_exp.train_npz_path)
-    manifest = load_manifest(cfg_exp.manifest_path, len(X))
+    manifest = load_manifest(
+        cfg_exp.manifest_path, len(X),
+        train_npz_path=cfg_exp.train_npz_path,
+        test_npz_path=cfg_exp.test_npz_path)
 
     normal_train_idx = np.asarray(manifest.get('normal_train_idx', []), dtype=np.int64)
     normal_val_idx = np.asarray(manifest.get('normal_val_idx', []), dtype=np.int64)
@@ -304,12 +309,19 @@ def main():
                 'input_shape': input_shape,
                 'latent_dim':  int(cfg_cae.latent_dim),
                 'noise_std':   float(cfg_cae.noise_std),
-                'val_loss':    stopper.best}, ckpt_path)
+                'val_loss':    stopper.best,
+                **checkpoint_provenance(
+                    manifest, 'configs/cae.yaml')}, ckpt_path)
     print(f'[OK] cae_best.pth → {ckpt_path}')
 
     # ---- Tau 계산 (val-normal 전용 — 훈련 세트 사용 금지) ----
     mse_normal_val = compute_mse_batch(model, X_normal_val, device, bs)
     taus = compute_tau(mse_normal_val)
+    taus.update({
+        'manifest_sha256': manifest['sha256'],
+        'train_sha256': manifest['train_sha256'],
+        'test_sha256': manifest['test_sha256'],
+    })
 
     tbl_dir = os.path.join(cfg_exp.output_dir.rstrip('/'), 'tables')
     fig_dir = os.path.join(cfg_exp.output_dir.rstrip('/'), 'figures')

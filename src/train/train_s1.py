@@ -20,7 +20,10 @@ from sklearn.metrics import (
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from src.models.dcnn import DCNN
-from src.train.common import EarlyStopping, load_manifest, make_supervised_loader, select_device
+from src.train.common import (
+    EarlyStopping, checkpoint_provenance, load_manifest,
+    make_supervised_loader, select_device,
+)
 from src.utils.config import load_experiment_config
 from src.utils.io import load_dataset
 from src.utils.seed import set_seed
@@ -92,7 +95,7 @@ def train_one_seed(
 
     model     = DCNN(num_classes=2).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn   = nn.CrossEntropyLoss()
+    loss_fn = nn.BCEWithLogitsLoss()
     stopper = EarlyStopping(patience=patience, mode='min')
 
     val_loss_history = []
@@ -104,7 +107,8 @@ def train_one_seed(
             xb = xb.to(device, non_blocking=pin_memory)
             yb = yb.to(device, non_blocking=pin_memory)
             optimizer.zero_grad(set_to_none=True)
-            loss_fn(model(xb), yb).backward()
+            targets = torch.nn.functional.one_hot(yb, num_classes=2).float()
+            loss_fn(model(xb), targets).backward()
             optimizer.step()
 
         # validate
@@ -114,7 +118,8 @@ def train_one_seed(
             for xb, yb in val_loader:
                 xb = xb.to(device, non_blocking=pin_memory)
                 yb = yb.to(device, non_blocking=pin_memory)
-                running_loss += loss_fn(model(xb), yb).item() * len(xb)
+                targets = torch.nn.functional.one_hot(yb, num_classes=2).float()
+                running_loss += loss_fn(model(xb), targets).item() * len(xb)
                 n += len(xb)
         val_loss = running_loss / n
         val_loss_history.append(val_loss)
@@ -139,6 +144,9 @@ def train_one_seed(
             'seed': seed,
             'val_loss': float(stopper.best),
             'input_shape': tuple(X.shape[1:]),
+            'loss': 'bce_with_logits_one_hot',
+            **checkpoint_provenance(
+                manifest, 'configs/model.yaml', 'configs/train.yaml'),
         }, checkpoint_path)
 
     # test
@@ -147,7 +155,7 @@ def train_one_seed(
     with torch.no_grad():
         for xb, yb in test_loader:
             logits = model(xb.to(device))
-            p = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+            p = torch.sigmoid(logits)[:, 1].cpu().numpy()
             probs.extend(p)
             preds.extend(logits.argmax(dim=1).cpu().numpy())
             trues.extend(yb.numpy())
@@ -174,6 +182,7 @@ def main():
     args = parser.parse_args()
 
     cfg_train = OmegaConf.load('configs/train.yaml').train
+    cfg_model = OmegaConf.load('configs/model.yaml').model
     cfg_exp = load_experiment_config()
 
     device = select_device()
@@ -181,13 +190,19 @@ def main():
 
     X,      y,      _ = load_dataset(cfg_exp.train_npz_path)
     X_test, y_test, _ = load_dataset(cfg_exp.test_npz_path)
+    expected_hw = (int(cfg_model.img_size), int(cfg_model.img_size))
+    if tuple(X.shape[2:]) != expected_hw or tuple(X_test.shape[2:]) != expected_hw:
+        raise ValueError(f'dataset image size must be {expected_hw}')
     y_bin      = binarize(y)
     y_test_bin = binarize(y_test)
     unique, counts = np.unique(y_bin, return_counts=True)
     print(f'Train: X={X.shape}  binary={dict(zip(unique.tolist(), counts.tolist()))}')
     print(f'Test:  X={X_test.shape}')
 
-    manifest = load_manifest(cfg_exp.manifest_path, len(X), len(X_test))
+    manifest = load_manifest(
+        cfg_exp.manifest_path, len(X), len(X_test),
+        train_npz_path=cfg_exp.train_npz_path,
+        test_npz_path=cfg_exp.test_npz_path)
     print(f'Manifest: train={len(manifest["train_idx"])}, '
           f'val={len(manifest["val_idx"])}, test(frozen)={len(manifest["test_idx"])}')
 
@@ -216,7 +231,10 @@ def main():
                     'val_loss_final', 'epochs_run']
 
     mean_row = {c: df[c].mean() for c in numeric_cols}
-    std_row  = {c: df[c].std()  for c in numeric_cols}
+    std_row = {
+        c: (df[c].std() if len(df) > 1 else 0.0)
+        for c in numeric_cols
+    }
     mean_row['seed'] = 'mean'
     std_row['seed']  = 'std'
 

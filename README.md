@@ -2,8 +2,8 @@
 
 차량용 이더넷 네트워크에서 발생하는 사이버 공격을 탐지·분류하는 딥러닝 기반 2단계 침입 탐지 시스템입니다. [TOW-IDS (Han et al., 2023)](#references) 의 3-wavelet 이미징 파이프라인을 기반으로, CAE 이상 탐지 게이트와 제로데이 평가 프로토콜(LOAO)을 추가 구현했습니다.
 
-> **현재 상태:** Phase 0~4 전체 구현 완료.  
-> PCAP → wavelet 이미지 → S1/S2/S3 학습 → LOAO 평가 → 시각화까지 단일 스크립트(`run.sh`)로 실행 가능합니다.
+> **현재 상태:** 파이프라인 강화 완료 (`fix/review-findings`) — smoke 격리·capture provenance·guarded split·벤치마크 수정 반영. 결과 파일(figures/tables)은 초기화됨, `bash scripts/run.sh all --skip-preprocess`로 재학습 후 재생성 필요.
+> PCAP → wavelet 이미지 → S1/S2/선택적 S3 → LOAO → 시각화를 `run.sh`로 실행합니다.
 
 ---
 
@@ -56,7 +56,7 @@
 | 이상 탐지 게이트 | 없음 | CAE (Denoising) + τ = μ+2σ |
 | 제로데이 평가 | 없음 | LOAO 5-fold × 5-seed 프로토콜 |
 | 추론 배치화 | 샘플별 반복 | anomalous 배치 1회 GPU 추론 |
-| 테스트 | 3개 | 69개 (io, 전처리, split, 모델, 학습, LOAO, 회귀 검증) |
+| 테스트 | 3개 | 69개 (io, provenance, 전처리, split, 모델, LOAO, 회귀 검증) |
 
 ---
 
@@ -98,10 +98,11 @@ results/tables/tau_values.json                                         │
     ▼                                                                   │
 입력 이미지                                                             │
     │                                                                   │
-    ├─ CAE 재구성 ──→ MSE ≤ τ ──────────────────→ Normal (종료)       │
+    ├─ CAE 재구성 ──→ MSE 기반 anomaly evidence                        │
     │                                                                   │
-    └─ MSE > τ ──→ DCNN 6-class 분류                                   │
+    └─ DCNN 6-class ─→ Normal/Attack evidence (전체 batch 평가)        │
                         │                                               │
+                        ├─ 두 모델 모두 Normal ──→ Normal               │
                         ├─ max_prob ≥ thr ──→ F_I / P_I / M_F / C_D / C_R
                         │                                               │
                         └─ max_prob < thr ──→ Unknown (제로데이 후보)  │
@@ -133,6 +134,9 @@ results/tables/tau_values.json                                         │
 │
 ├── experiments/
 │   └── leave_one_out.py   # Phase 4: LOAO 5-fold 제로데이 평가 하네스
+│
+├── docs/
+│   └── presentation/      # 발표 구성과 리허설 체크리스트
 │
 ├── results/
 │   ├── checkpoints/       # cae_best.pth, s2_seed_{0..4}_best.pth (git 미포함)
@@ -188,6 +192,9 @@ results/tables/tau_values.json                                         │
 │
 ├── requirements.txt
 ├── requirements-dev.txt
+├── requirements.lock.txt
+├── CONTRIBUTING.md
+├── PLAN.md
 ├── DATASET.md
 └── spec_phase0_to_3.docx       # 전체 설계 스펙 문서
 ```
@@ -313,8 +320,10 @@ python -m src.utils.split \
 - `data/processed/normal_only_idx.npy` — CAE 학습용 Normal 인덱스
 
 여러 캡처가 있으면 `capture_group_stratified`, 단일 캡처면
-`temporal_segment_stratified`를 사용합니다. 실제 TOW-IDS 기본 입력은 단일 캡처이므로
-시간상 인접한 윈도우를 guard gap만큼 train에서 제거합니다.
+`temporal_contiguous_block`을 사용합니다. 실제 TOW-IDS 기본 입력은 단일 캡처이므로
+validation은 전체 시간축의 마지막 연속 블록이며, 경계에서 guard gap만큼 train
+윈도우를 제거합니다. 이 데이터의 시간순 클래스 배치 특성상 validation에는 일부
+클래스만 존재할 수 있으며, early stopping 지표는 실제 존재 클래스에 대해서만 계산합니다.
 
 ```bash
 python -c "import json; m=json.load(open('data/processed/split_manifest.json')); print(m['split_strategy'], m['guard_removed_samples'])"
@@ -372,7 +381,7 @@ python -m experiments.leave_one_out --smoke  # smoke
 
 ```bash
 python scripts/plot_loao_bar.py        # LOAO 탐지율 bar chart
-python scripts/plot_unknown_case.py    # Unknown case 4-panel
+python scripts/plot_unknown_case.py    # 실제 held-out Unknown case 4-panel
 python scripts/plot_confusion_matrix.py  # S2 6-class + S3 7-class CM
 python scripts/comparison_table.py    # S1/S2/S3 3종 비교표
 ```
@@ -386,19 +395,33 @@ python scripts/comparison_table.py    # S1/S2/S3 3종 비교표
 #### 코드 회귀 테스트
 
 ```bash
-pytest tests/ -q   # 69 passed 기대
+pytest tests/ -q
 ```
 
 ---
 
-## 8. 현재 실험 결과 요약
+## 8. 실험 결과 상태
 
-> **데이터셋**: TOW-IDS PCAP (train 18,808 / test 12,368 샘플, 단일 캡처 시간 구간 분할 + guard gap)
-> **하드웨어**: Apple M-series MPS
-> **재현 조건**: `split_manifest.json` 고정, seeds=[0,1,2,3,4], checkpoint 선택 기준 = val_macro_f1
+현재 schema v2 데이터는 train **18,809**, frozen test **12,369** window입니다.
+연속 시간 validation은 1,881 window이며 guard gap을 적용합니다.
 
-아래에 커밋된 수치는 split/provenance 강화 전 실행 결과입니다. 수정된 프로토콜의 최종
-수치는 `bash scripts/run.sh all`로 데이터, checkpoint, 표를 다시 생성한 뒤 갱신해야 합니다.
+파이프라인 강화(`fix/review-findings`)로 split 전략·provenance 검증·벤치마크 방식이 변경됨에 따라
+기존 표와 그림은 모두 삭제했습니다. 아래 `<details>`는 schema v1 시절 참고용 해석 기록입니다.
+
+최신 수치를 얻으려면 먼저 전처리 결과가 있다면:
+
+```bash
+bash scripts/run.sh all --skip-preprocess
+```
+
+전처리부터 전부 재실행하려면:
+
+```bash
+bash scripts/run.sh all
+```
+
+<details>
+<summary>폐기된 schema v1 결과 해석 기록</summary>
 
 ---
 
@@ -597,6 +620,8 @@ bash scripts/run.sh smoke   # smoke 검증 (1 fold, 1 seed, 1 epoch)
 
 ---
 
+</details>
+
 ## 9. 한계 및 향후 연구
 
 ### 현재 한계
@@ -642,7 +667,8 @@ experiment:
   conf_thr: 0.5
   conf_thr_source: fixed   # fixed | artifact
   conf_thr_artifact: results/tables/conf_threshold.json
-  loao_conf_thr_mode: fixed
+  loao_conf_thr_mode: validation
+  target_known_reject_rate: 0.05
   benchmark_batch_size: 64
   benchmark_warmup: 2
   benchmark_repeats: 5
@@ -683,7 +709,8 @@ cae:
 - **Seed**: S1/S2 `seeds: [0,1,2,3,4]`, CAE `seed=42` 고정
 - **Split**: `split_manifest.json` — sha256 기록, 변경 금지
 - **Checkpoint**: `val_macro_f1_best` 기준 자동 선택 (test 점수로 checkpoint 선택 금지)
-- **환경**: `requirements.txt` 고정 버전, `torch.backends.cudnn.deterministic=True`
+- **환경**: 재현 실행에는 `requirements.lock.txt` 사용,
+  deterministic algorithm과 고정 hash seed 적용
 
 > ⚠ `split_manifest.json`을 교체하거나 `dataset_train.npz`를 재생성하면  
 > S1·S2·CAE를 전부 재학습해야 split 일관성이 유지됩니다.
@@ -707,6 +734,12 @@ cae:
 7. P. Vincent, H. Larochelle, Y. Bengio, and P.-A. Manzagol, "Extracting and Composing Robust Features with Denoising Autoencoders," *ICML*, 2008. https://doi.org/10.1145/1390156.1390294
 
 8. D. Hendrycks and K. Gimpel, "A Baseline for Detecting Misclassified and Out-of-Distribution Examples in Neural Networks," *ICLR*, 2017. https://openreview.net/forum?id=Hkg4TI9xl
+
+9. S. Jeong et al., Automotive Ethernet IDS base CNN study, *Vehicular Communications*, 2021.
+
+10. Alkhatib et al., autoencoder-based Automotive Ethernet binary IDS, arXiv:2202.00045, 2022.
+
+11. Related open-set/two-stage IDS studies, arXiv:2408.08433 and arXiv:2403.04193.
 
 ---
 

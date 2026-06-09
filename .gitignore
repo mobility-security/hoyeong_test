@@ -2,6 +2,10 @@ data/raw/*
 !data/raw/README.md
 data/smoke/
 results/smoke/
+results/tables/*
+!results/tables/README.md
+results/figures/*
+!results/figures/README.md
 *.pcap
 *.npz
 npz.zip

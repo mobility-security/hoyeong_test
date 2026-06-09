@@ -69,7 +69,11 @@ def test_save_bad_shape_raises_schema_error_without_meta(tmp_path):
 def test_pcap_id_roundtrip_and_sidecar(tmp_path):
     X, y = _good(n=8)
     pid = np.repeat(np.arange(4), 2).astype(np.int64)  # 4개 pcap
-    p = save_dataset(tmp_path / "d.npz", X, y, build_meta(32, 32), pcap_id=pid)
+    starts = np.tile(np.array([0, 64], dtype=np.int64), 4)
+    p = save_dataset(
+        tmp_path / "d.npz", X, y,
+        build_meta(32, 32, group_semantics='capture'), pcap_id=pid,
+        packet_start=starts, packet_end=starts + 64)
     # with_pcap_id
     X2, y2, meta2, pid2 = load_dataset(p, with_pcap_id=True)
     assert np.array_equal(pid, pid2)
@@ -116,6 +120,14 @@ def test_numpy_typed_meta_serializes(tmp_path):
     p = save_dataset(tmp_path / "m.npz", X, y, meta)
     _, _, meta2 = load_dataset(p)
     assert meta2["n_samples"] == 8 and meta2["counts"] == [1, 2, 3]
+
+
+def test_sidecar_tampering_is_rejected(tmp_path):
+    X, y = _good()
+    path = save_dataset(tmp_path / 'd.npz', X, y, build_meta(32, 32))
+    path.with_suffix('.meta.json').write_text('{}', encoding='utf-8')
+    with pytest.raises(SchemaError, match='does not match'):
+        load_dataset(path)
 
 
 def test_meta_hw_mismatch_raises():

@@ -28,7 +28,10 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from src.models.dcnn import DCNN
-from src.train.common import EarlyStopping, load_manifest, make_supervised_loader, select_device
+from src.train.common import (
+    EarlyStopping, checkpoint_provenance, load_manifest,
+    make_supervised_loader, select_device,
+)
 from src.utils.config import load_experiment_config
 from src.utils.focal_loss import FocalLoss
 from src.utils.io import LABEL_NAMES, NUM_CLASSES, load_dataset
@@ -143,6 +146,10 @@ def train_one_seed(
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn   = FocalLoss(gamma=2.0, weight=class_weights)
     stopper   = EarlyStopping(patience=patience, mode='max')
+    val_labels = sorted(np.unique(y[val_idx]).tolist())
+    missing_val = np.setdiff1d(classes, val_labels)
+    if len(missing_val):
+        print(f'  [WARN] temporal validation lacks classes: {missing_val.tolist()}')
 
     for epoch in range(1, epochs + 1):
         # --- train ---
@@ -159,7 +166,7 @@ def train_one_seed(
         val_macro_f1 = f1_score(
             y_vt,
             y_vp,
-            labels=list(range(NUM_CLASSES)),
+            labels=val_labels,
             average='macro',
             zero_division=0,
         )
@@ -184,6 +191,8 @@ def train_one_seed(
         'seed': seed,
         'val_macro_f1': float(stopper.best),
         'input_shape': tuple(X.shape[1:]),
+        **checkpoint_provenance(
+            manifest, 'configs/model.yaml', 'configs/train.yaml'),
     }, ckpt_path)
     print(f'  Saved checkpoint: {ckpt_path}')
 
@@ -257,10 +266,16 @@ def main():
 
     X,      y,      _ = load_dataset(cfg_exp.train_npz_path)
     X_test, y_test, _ = load_dataset(cfg_exp.test_npz_path)
+    expected_hw = (int(cfg_model.img_size), int(cfg_model.img_size))
+    if tuple(X.shape[2:]) != expected_hw or tuple(X_test.shape[2:]) != expected_hw:
+        raise ValueError(f'dataset image size must be {expected_hw}')
     print(f'Train: X={X.shape}  labels={sorted(set(y.tolist()))}')
     print(f'Test:  X={X_test.shape}')
 
-    manifest = load_manifest(cfg_exp.manifest_path, len(X), len(X_test))
+    manifest = load_manifest(
+        cfg_exp.manifest_path, len(X), len(X_test),
+        train_npz_path=cfg_exp.train_npz_path,
+        test_npz_path=cfg_exp.test_npz_path)
     print(f'Manifest: train={len(manifest["train_idx"])}, '
           f'val={len(manifest["val_idx"])}, test(frozen)={len(manifest["test_idx"])}')
 
@@ -289,7 +304,10 @@ def main():
     df_sum = pd.DataFrame(summary_rows)
     num_cols = ['accuracy', 'macro_f1', 'weighted_f1', 'val_macro_f1_best']
     mean_row = {c: df_sum[c].mean() for c in num_cols}
-    std_row  = {c: df_sum[c].std()  for c in num_cols}
+    std_row = {
+        c: (df_sum[c].std() if len(df_sum) > 1 else 0.0)
+        for c in num_cols
+    }
     mean_row['seed'] = 'mean'
     std_row['seed']  = 'std'
     df_sum = pd.concat([df_sum, pd.DataFrame([mean_row, std_row])], ignore_index=True)
@@ -299,7 +317,7 @@ def main():
     if not df_pc.empty:
         pc_num = ['precision', 'recall', 'f1', 'support']
         pc_mean = df_pc.groupby('class')[pc_num].mean().reset_index()
-        pc_std  = df_pc.groupby('class')[pc_num].std().reset_index()
+        pc_std = df_pc.groupby('class')[pc_num].std().fillna(0.0).reset_index()
         pc_mean['seed'] = 'mean'
         pc_std['seed']  = 'std'
         df_pc = pd.concat([df_pc, pc_mean, pc_std], ignore_index=True)
