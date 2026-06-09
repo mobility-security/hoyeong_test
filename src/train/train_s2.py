@@ -132,6 +132,7 @@ def train_one_seed(
         raise ValueError(f'train split is missing classes: {missing_classes.tolist()}')
     weights = compute_class_weight(class_weight='balanced',
                                    classes=classes, y=y_train)
+    weights[3] *= 1.5
     class_weights = torch.FloatTensor(weights).to(device)
 
     pin_memory = device.type == 'cuda'
@@ -144,7 +145,7 @@ def train_one_seed(
 
     model     = DCNN(num_classes=NUM_CLASSES, dropout=dropout).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn   = FocalLoss(gamma=2.0, weight=class_weights)
+    loss_fn   = FocalLoss(gamma=3.0, weight=class_weights)
     stopper   = EarlyStopping(patience=patience, mode='max')
     val_labels = sorted(np.unique(y[val_idx]).tolist())
     missing_val = np.setdiff1d(classes, val_labels)

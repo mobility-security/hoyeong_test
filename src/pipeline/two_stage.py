@@ -209,11 +209,7 @@ class TwoStagePipeline:
             self.cae.eval()
 
         if self.use_cae:
-            reconstructed = self.cae(x)
-            if reconstructed.shape != x.shape:
-                raise ValueError(
-                    f'CAE output shape {tuple(reconstructed.shape)} != input {tuple(x.shape)}')
-            mse_tensor = ((reconstructed - x) ** 2).mean(dim=(1, 2, 3))
+            mse_tensor = self.cae.mse_loss(x)
             if not torch.isfinite(mse_tensor).all():
                 raise ValueError('CAE produced non-finite reconstruction scores')
             cae_anomalous_tensor = mse_tensor > self.tau
@@ -343,6 +339,8 @@ class TwoStagePipeline:
                 input_shape=tuple(cae_checkpoint['input_shape']),
                 latent_dim=int(cae_checkpoint['latent_dim']),
                 noise_std=float(cae_checkpoint.get('noise_std', 0.05)),
+                cae_input_size=int(cae_checkpoint.get('cae_input_size', 32)),
+                use_detail_channels=bool(cae_checkpoint.get('use_detail_channels', False)),
             )
             cae.load_state_dict(cae_checkpoint['model_state_dict'])
             cae.eval().to(device)
