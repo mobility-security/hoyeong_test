@@ -1,4 +1,4 @@
 model:
   num_classes: 6       # Phase1: 2 / Phase2: 6
   dropout: 0.5
-  img_size: 32          # wavelet LL 변환 후 DCNN 입력 공간 크기
+  img_size: 64          # wavelet LL 변환 후 DCNN 입력 공간 크기

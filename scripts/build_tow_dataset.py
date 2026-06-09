@@ -6,8 +6,8 @@
   - y_train.csv / y_test.csv      : 헤더 없는 (idx, binary, multiclass) — 패킷과 1:1
     col3(multiclass) ∈ {Normal, F_I, P_I, M_F, C_D, C_R} = 우리 라벨명과 동일
 
-파이프라인: 패킷 raw bytes → 64바이트 패딩/절단 → 연속 64패킷(stride 64, 비중첩)
-            → 64x64 이미지 → /255 → 3-wavelet(coif1/db3/rbio1.3) LL → (3,32,32).
+파이프라인: 패킷 raw bytes → 128바이트 패딩/절단 → 연속 128패킷(stride 128, 비중첩)
+            → 128x128 이미지 → /255 → 3-wavelet(coif1/db3/rbio1.3) LL → (3,64,64).
 윈도우 라벨: 윈도우 내 공격이 있으면 최빈 공격, 없으면 Normal (보안 보수적).
 pcap_id   : 실제 원본 capture id. 이 스크립트는 split마다 PCAP 하나를 읽으므로 모두 0.
 packet_start/end: 각 이미지가 사용한 원본 패킷의 [start, end) 범위.

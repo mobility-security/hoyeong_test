@@ -29,14 +29,14 @@ def build_stub_dataset(
     group_labels = np.arange(n_groups, dtype=np.int64) % 6
     y = np.repeat(group_labels, samples_per_group)
     pcap_id = np.repeat(np.arange(n_groups, dtype=np.int64), samples_per_group)
-    X = rng.random((len(y), 3, 32, 32), dtype=np.float32) * 0.35
+    X = rng.random((len(y), 3, 64, 64), dtype=np.float32) * 0.35
     X[:, 0] += y[:, None, None].astype(np.float32) * 0.1
     X = np.clip(X, 0.0, 1.0).astype(np.float32)
-    starts_one = np.arange(samples_per_group, dtype=np.int64) * 64
+    starts_one = np.arange(samples_per_group, dtype=np.int64) * 128
     packet_start = np.tile(starts_one, n_groups)
-    packet_end = packet_start + 64
+    packet_end = packet_start + 128
     meta = build_meta(
-        32, 32, seed=seed, stub=True,
+        64, 64, seed=seed, stub=True,
         group_semantics='capture',
         packet_range_semantics='zero_based_half_open',
         created_by='make_stub_dataset.py',
