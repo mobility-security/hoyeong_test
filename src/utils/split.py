@@ -262,6 +262,64 @@ def temporal_trainval_split(
     return train_idx, val_idx, removed
 
 
+def class_temporal_trainval_split(
+    packet_start: np.ndarray,
+    packet_end: np.ndarray,
+    y: np.ndarray,
+    val_ratio: float = 0.15,
+    guard_gap_packets: int = 0,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Use the temporal tail of every class for validation."""
+    packet_start = np.asarray(packet_start)
+    packet_end = np.asarray(packet_end)
+    y = np.asarray(y)
+    if packet_start.ndim != 1 or packet_end.ndim != 1 or y.ndim != 1:
+        raise ValueError('packet_start, packet_end, and y must be 1-D')
+    if not (len(packet_start) == len(packet_end) == len(y)) or len(y) < 2:
+        raise ValueError('class-temporal split requires aligned packet ranges and labels')
+    if not 0.0 < val_ratio < 1.0:
+        raise ValueError(f'val_ratio must be in (0, 1), got {val_ratio}')
+    if guard_gap_packets < 0:
+        raise ValueError(f'guard_gap_packets must be non-negative, got {guard_gap_packets}')
+    if np.any(packet_start < 0) or np.any(packet_end <= packet_start):
+        raise ValueError('invalid packet ranges')
+    if np.any(packet_start[1:] < packet_start[:-1]):
+        raise ValueError('packet ranges must be ordered for temporal splitting')
+
+    val_parts = []
+    for label in np.unique(y):
+        class_idx = np.flatnonzero(y == label)
+        if len(class_idx) < 2:
+            raise ValueError(
+                f'class {int(label)} needs at least two samples for class-temporal splitting')
+        n_val = min(max(int(round(len(class_idx) * val_ratio)), 1), len(class_idx) - 1)
+        val_parts.append(class_idx[-n_val:])
+    val_idx = np.sort(np.concatenate(val_parts).astype(np.int64, copy=False))
+
+    train_mask = np.ones(len(y), dtype=bool)
+    train_mask[val_idx] = False
+    base_train_count = int(train_mask.sum())
+    val_starts = packet_start[val_idx]
+    val_ends = packet_end[val_idx]
+    for index in np.flatnonzero(train_mask):
+        guarded_start = int(packet_start[index]) - guard_gap_packets
+        guarded_end = int(packet_end[index]) + guard_gap_packets
+        if np.any((val_starts < guarded_end) & (val_ends > guarded_start)):
+            train_mask[index] = False
+    train_idx = np.flatnonzero(train_mask).astype(np.int64)
+    removed = base_train_count - len(train_idx)
+
+    expected_labels = set(np.unique(y).tolist())
+    train_labels = set(np.unique(y[train_idx]).tolist())
+    val_labels = set(np.unique(y[val_idx]).tolist())
+    if train_labels != expected_labels or val_labels != expected_labels:
+        raise ValueError(
+            'class-temporal split could not preserve full class coverage: '
+            f'train={sorted(train_labels)}, val={sorted(val_labels)}, '
+            f'expected={sorted(expected_labels)}')
+    return train_idx, val_idx, removed
+
+
 def normal_only_indices(y: np.ndarray) -> np.ndarray:
     """CAE 학습용 Normal(0) 샘플 인덱스."""
     y = np.asarray(y)
@@ -368,10 +426,10 @@ def make_split_manifest(
             if packet_start is None or packet_end is None:
                 raise ValueError(
                     'single-capture datasets require packet_start/packet_end provenance')
-            train_idx_arr, val_idx_arr, guard_removed_samples = temporal_trainval_split(
+            train_idx_arr, val_idx_arr, guard_removed_samples = class_temporal_trainval_split(
                 packet_start, packet_end, y_train, val_ratio=val_ratio,
                 guard_gap_packets=guard_gap_packets)
-            split_strategy = 'temporal_contiguous_block'
+            split_strategy = 'class_temporal_tail'
     else:
         if not allow_unsafe_fallback:
             raise ValueError(
@@ -394,6 +452,13 @@ def make_split_manifest(
     test_idx = list(range(n_test))
     normal_train_idx = [index for index in train_idx if y_train[index] == 0]
     normal_val_idx = [index for index in val_idx if y_train[index] == 0]
+    expected_labels = set(range(len(LABEL_NAMES)))
+    train_labels = set(np.unique(y_train[train_idx_arr]).tolist())
+    val_labels = set(np.unique(y_train[val_idx_arr]).tolist())
+    if train_labels != expected_labels or val_labels != expected_labels:
+        raise ValueError(
+            'train and validation must both contain every canonical class: '
+            f'train={sorted(train_labels)}, val={sorted(val_labels)}')
 
     manifest = {
         'schema_version': MANIFEST_SCHEMA_VERSION,

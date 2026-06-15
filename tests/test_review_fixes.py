@@ -11,7 +11,10 @@ from src.utils.benchmark import benchmark_predict
 from src.utils.config import load_experiment_config, resolve_conf_threshold
 from src.utils.io import load_dataset
 from src.utils.split import make_split_manifest
-from src.train.common import config_sha256, load_manifest, validate_checkpoint_provenance
+from src.train.common import (
+    config_sha256, load_manifest, result_bundle_provenance,
+    validate_checkpoint_provenance, validate_result_bundle,
+)
 from src.utils.split import compute_manifest_sha256, validate_manifest_provenance
 
 
@@ -57,12 +60,23 @@ def test_single_capture_manifest_uses_temporal_guard(tmp_path):
     manifest = make_split_manifest(
         str(train_path), str(test_path), str(tmp_path / 'manifest.json'),
         val_ratio=0.2, guard_gap_packets=64)
-    assert manifest['split_strategy'] == 'temporal_contiguous_block'
+    assert manifest['split_strategy'] == 'class_temporal_tail'
     assert manifest['guard_removed_samples'] > 0
     train_idx = np.asarray(manifest['train_idx'])
     val_idx = np.asarray(manifest['val_idx'])
-    assert train_idx.max() < val_idx.min()
-    assert ends[train_idx].max() + 64 <= starts[val_idx].min()
+    assert set(y[train_idx]) == set(range(6))
+    assert set(y[val_idx]) == set(range(6))
+    for train_index in train_idx:
+        assert not np.any(
+            (starts[val_idx] < ends[train_index] + 64)
+            & (ends[val_idx] > starts[train_index] - 64))
+
+
+def test_cae_supports_non_multiple_internal_size():
+    from src.models.cae import CAE
+    model = CAE(input_shape=(3, 64, 64), cae_input_size=30)
+    X = torch.zeros(2, 3, 64, 64)
+    assert model.mse_loss(X).shape == (2,)
 
 
 def test_s3_full_metrics_count_unknown_as_error():
@@ -158,3 +172,17 @@ def test_checkpoint_config_hash_is_enforced(tmp_path):
     config.write_text('value: 2\n', encoding='utf-8')
     with pytest.raises(ValueError, match='config_sha256'):
         validate_checkpoint_provenance(checkpoint, manifest, config)
+
+
+def test_result_bundle_rejects_stale_table(tmp_path):
+    config = tmp_path / 'config.yaml'
+    table = tmp_path / 'table.csv'
+    config.write_text('value: 1\n', encoding='utf-8')
+    table.write_text('metric\n1\n', encoding='utf-8')
+    manifest = {'sha256': 'm', 'train_sha256': 'tr', 'test_sha256': 'te'}
+    provenance = result_bundle_provenance(
+        manifest, {'table': table}, config, routing_mode='strict_cascade')
+    validate_result_bundle(provenance, manifest, {'table': table}, config)
+    table.write_text('metric\n2\n', encoding='utf-8')
+    with pytest.raises(ValueError, match='does not match provenance'):
+        validate_result_bundle(provenance, manifest, {'table': table}, config)

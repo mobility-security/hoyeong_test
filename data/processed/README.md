@@ -20,6 +20,8 @@ window/stride, seed, Git SHA를 필수로 기록합니다. `pcap_id`가 있으�
 
 manifest는 NPZ와 sidecar SHA-256을 저장합니다. 파일 내용이나 manifest JSON이 바뀌면
 학습과 추론이 즉시 실패하므로 데이터 변경 후 반드시 manifest를 다시 생성해야 합니다.
+단일 capture는 `class_temporal_tail` 전략으로 각 클래스의 시간상 마지막
+샘플을 validation으로 사용하며 packet guard 위반 train window를 제거합니다.
 
 `bash scripts/run.sh smoke`가 생성하는 임시 데이터는 `data/smoke/`에 격리되며 이 디렉터리의 운영 데이터와 manifest를 덮어쓰지 않습니다.
 

@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from src.utils.io import LABEL_NAMES, NUM_CLASSES, UNKNOWN_LABEL
 
 PIPELINE_LABEL_NAMES = LABEL_NAMES + ['Unknown']
+ROUTING_MODES = {'strict_cascade', 's2_recovery'}
 
 
 # ---------------------------------------------------------------------------
@@ -26,6 +27,24 @@ def _validate_thresholds(tau: float, conf_thr: float) -> tuple[float, float]:
     if not 0.0 <= conf_thr <= 1.0:
         raise ValueError(f'conf_thr must be in [0, 1], got {conf_thr}')
     return tau, conf_thr
+
+
+def _effective_anomalous(
+    cae_anomalous,
+    predicted_class,
+    routing_mode: str,
+) -> np.ndarray:
+    """Resolve the Stage-1 gate according to the declared experiment mode."""
+    if routing_mode not in ROUTING_MODES:
+        raise ValueError(
+            f'routing_mode must be one of {sorted(ROUTING_MODES)}, got {routing_mode}')
+    cae_anomalous = np.asarray(cae_anomalous, dtype=bool)
+    predicted_class = np.asarray(predicted_class, dtype=np.int64)
+    if cae_anomalous.shape != predicted_class.shape:
+        raise ValueError('CAE and Stage-2 routing arrays must have the same shape')
+    if routing_mode == 'strict_cascade':
+        return cae_anomalous
+    return cae_anomalous | (predicted_class != 0)
 
 
 def _route_predictions(
@@ -120,6 +139,7 @@ class TwoStageIDS:
         tau: float,
         conf_thr: float = 0.5,
         use_cae: bool = True,
+        routing_mode: str = 'strict_cascade',
     ):
         if use_cae and scorer is None:
             raise ValueError('scorer is required when use_cae=True')
@@ -129,6 +149,8 @@ class TwoStageIDS:
         self.scorer = scorer
         self.stage2_predict_proba = stage2_predict_proba
         self.use_cae = bool(use_cae)
+        self.routing_mode = routing_mode
+        _effective_anomalous(np.empty(0, dtype=bool), np.empty(0, dtype=np.int64), routing_mode)
 
     def predict(self, X: np.ndarray, return_detail: bool = False):
         X = np.asarray(X)
@@ -152,7 +174,9 @@ class TwoStageIDS:
             self.stage2_predict_proba(X), n_samples)
         predicted_class = probs.argmax(axis=1).astype(np.int64)
         max_probability = probs.max(axis=1)
-        anomalous = cae_anomalous | (predicted_class != 0)
+        anomalous = _effective_anomalous(
+            cae_anomalous, predicted_class,
+            's2_recovery' if not self.use_cae else self.routing_mode)
 
         final = _route_predictions(
             anomalous, predicted_class, max_probability, self.conf_thr)
@@ -178,6 +202,7 @@ class TwoStagePipeline:
         tau: float,
         conf_thr: float = 0.5,
         use_cae: bool = True,
+        routing_mode: str = 'strict_cascade',
     ):
         if s2_model is None:
             raise ValueError('s2_model is required')
@@ -187,6 +212,8 @@ class TwoStagePipeline:
         self.cae = cae
         self.s2 = s2_model
         self.use_cae = bool(use_cae)
+        self.routing_mode = routing_mode
+        _effective_anomalous(np.empty(0, dtype=bool), np.empty(0, dtype=np.int64), routing_mode)
         self.class_names = PIPELINE_LABEL_NAMES
 
     @torch.no_grad()
@@ -218,8 +245,18 @@ class TwoStagePipeline:
                 (n_samples,), float('nan'), dtype=torch.float32, device=x.device)
             cae_anomalous_tensor = torch.ones(n_samples, dtype=torch.bool, device=x.device)
 
-        logits = self.s2(x)
-        expected_shape = (n_samples, NUM_CLASSES)
+        strict_gate = self.use_cae and self.routing_mode == 'strict_cascade'
+        routed_tensor = cae_anomalous_tensor if strict_gate else torch.ones(
+            n_samples, dtype=torch.bool, device=x.device)
+        routed_count = int(routed_tensor.sum().item())
+        predicted_class = np.zeros(n_samples, dtype=np.int64)
+        max_probability = np.full(n_samples, np.nan, dtype=np.float32)
+        if routed_count == 0:
+            anomalous = np.zeros(n_samples, dtype=bool)
+            return mse_tensor.cpu().numpy(), anomalous, predicted_class, max_probability
+
+        logits = self.s2(x[routed_tensor])
+        expected_shape = (routed_count, NUM_CLASSES)
         if tuple(logits.shape) != expected_shape:
             raise ValueError(
                 f's2 logits must have shape {expected_shape}, got {tuple(logits.shape)}')
@@ -227,10 +264,12 @@ class TwoStagePipeline:
             raise ValueError('s2 model produced nan or inf logits')
         probabilities = F.softmax(logits, dim=1)
         max_prob_tensor, class_tensor = probabilities.max(dim=1)
-        predicted_class = class_tensor.cpu().numpy()
-        max_probability = max_prob_tensor.cpu().numpy()
-        anomalous_tensor = cae_anomalous_tensor | (class_tensor != 0)
-        anomalous = anomalous_tensor.cpu().numpy()
+        routed_numpy = routed_tensor.cpu().numpy()
+        predicted_class[routed_numpy] = class_tensor.cpu().numpy()
+        max_probability[routed_numpy] = max_prob_tensor.cpu().numpy()
+        anomalous = _effective_anomalous(
+            cae_anomalous_tensor.cpu().numpy(), predicted_class,
+            's2_recovery' if not self.use_cae else self.routing_mode)
 
         return (
             mse_tensor.cpu().numpy(),
@@ -313,6 +352,7 @@ class TwoStagePipeline:
         tau_json_path: str | Path,
         conf_thr: float = 0.5,
         use_cae: bool = True,
+        routing_mode: str = 'strict_cascade',
         device: torch.device = torch.device('cpu'),
         manifest: dict | None = None,
     ):
@@ -335,12 +375,17 @@ class TwoStagePipeline:
             missing = required - set(cae_checkpoint)
             if missing:
                 raise ValueError(f'CAE checkpoint missing keys: {sorted(missing)}')
+            for key in ('noise_std', 'use_detail_channels', 'cae_input_size'):
+                if key not in cae_checkpoint:
+                    raise ValueError(
+                        f'CAE checkpoint missing key "{key}"; '
+                        'retrain with train_cae.py to generate a complete checkpoint')
             cae = CAE(
                 input_shape=tuple(cae_checkpoint['input_shape']),
                 latent_dim=int(cae_checkpoint['latent_dim']),
-                noise_std=float(cae_checkpoint.get('noise_std', 0.05)),
-                cae_input_size=int(cae_checkpoint.get('cae_input_size', 32)),
-                use_detail_channels=bool(cae_checkpoint.get('use_detail_channels', False)),
+                noise_std=float(cae_checkpoint['noise_std']),
+                cae_input_size=int(cae_checkpoint['cae_input_size']),
+                use_detail_channels=bool(cae_checkpoint['use_detail_channels']),
             )
             cae.load_state_dict(cae_checkpoint['model_state_dict'])
             cae.eval().to(device)
@@ -389,4 +434,5 @@ class TwoStagePipeline:
             tau=tau_values[headline],
             conf_thr=conf_thr,
             use_cae=use_cae,
+            routing_mode=routing_mode,
         )

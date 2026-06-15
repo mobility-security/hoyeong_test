@@ -77,7 +77,9 @@ def compute_loao_metrics(y_true, y_pred, mse, tau) -> dict:
         float((mse[excluded_mask] > tau).mean()) if excluded_mask.any() else float('nan')
     )
     unknown_rate = (
-        float((y_pred[excluded_mask] == UNKNOWN).mean()) if excluded_mask.any() else float('nan')
+        float(((mse[excluded_mask] > tau)
+               & (y_pred[excluded_mask] == UNKNOWN)).mean())
+        if excluded_mask.any() else float('nan')
     )
     normal_fpr = (
         float((mse[normal_mask] > tau).mean()) if normal_mask.any() else float('nan')

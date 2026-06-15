@@ -150,7 +150,9 @@ def train_one_seed(
     val_labels = sorted(np.unique(y[val_idx]).tolist())
     missing_val = np.setdiff1d(classes, val_labels)
     if len(missing_val):
-        print(f'  [WARN] temporal validation lacks classes: {missing_val.tolist()}')
+        raise ValueError(
+            f'validation split is missing classes: {missing_val.tolist()}; '
+            'rebuild the class-covered split manifest')
 
     for epoch in range(1, epochs + 1):
         # --- train ---

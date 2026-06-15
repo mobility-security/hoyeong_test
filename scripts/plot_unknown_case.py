@@ -21,6 +21,7 @@ from experiments.leave_one_out import UNKNOWN_LABEL, _predict_loao, load_cae
 from src.models.dcnn import DCNN
 from src.train.common import (
     load_manifest, select_device, validate_checkpoint_provenance,
+    validate_result_bundle,
 )
 from src.utils.config import load_experiment_config
 from src.utils.io import LABEL_MAP, LABEL_NAMES, load_dataset
@@ -34,21 +35,29 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('--attack', choices=list(LABEL_MAP)[1:], default='F_I')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--allow-missing', action='store_true',
+                        help='exit successfully when no actual Unknown case exists')
     args = parser.parse_args()
 
     cfg = load_experiment_config()
     if not bool(cfg.get('use_cae', True)):
         raise ValueError('Unknown CAE reconstruction figure requires experiment.use_cae=true')
 
+    from src.train.train_cae import compute_mse_batch, compute_tau as _compute_tau
+
     output_dir = Path(str(cfg.output_dir))
-    X_train, _, _ = load_dataset(cfg.train_npz_path)
+    X_train, y_train, _ = load_dataset(cfg.train_npz_path)
     X_test, y_test, _ = load_dataset(cfg.test_npz_path)
     manifest = load_manifest(
         cfg.manifest_path, len(X_train), len(X_test),
         train_npz_path=cfg.train_npz_path, test_npz_path=cfg.test_npz_path)
     device = select_device()
 
-    cae, tau = load_cae(output_dir / 'checkpoints' / 'cae_best.pth', device, manifest)
+    cae = load_cae(output_dir / 'checkpoints' / 'cae_best.pth', device, manifest)
+    _val_idx = np.asarray(manifest['val_idx'], dtype=np.int64)
+    _normal_val_mask = y_train[_val_idx] == 0
+    _mse_nv = compute_mse_batch(cae, X_train[_val_idx][_normal_val_mask], device)
+    tau = float(_compute_tau(_mse_nv)['tau_2sigma'])
     s2_path = (output_dir / 'checkpoints' / 'loao'
                / f'exclude_{args.attack}_seed_{args.seed}.pth')
     checkpoint = torch.load(s2_path, map_location=device, weights_only=True)
@@ -64,6 +73,16 @@ def main() -> None:
     s2.eval()
 
     rows = pd.read_csv(output_dir / 'tables' / 'loao_per_fold.csv')
+    provenance_path = output_dir / 'tables' / 'loao.provenance.json'
+    provenance = json.loads(provenance_path.read_text(encoding='utf-8'))
+    validate_result_bundle(
+        provenance, manifest,
+        {
+            'per_fold': output_dir / 'tables' / 'loao_per_fold.csv',
+            'summary': output_dir / 'tables' / 'loao_summary.csv',
+        },
+        'configs/model.yaml', 'configs/train.yaml', 'configs/cae.yaml',
+        'configs/experiment.yaml')
     selected_row = rows[
         (rows['excluded_attack'] == args.attack) & (rows['seed'] == args.seed)]
     if selected_row.empty:
@@ -79,6 +98,9 @@ def main() -> None:
         cae, s2, X_attack, tau, conf_thr, device, use_cae=True)
     unknown_local = np.flatnonzero(predictions == UNKNOWN_LABEL)
     if len(unknown_local) == 0:
+        if args.allow_missing:
+            print(f'[WARN] fold {args.attack}/seed {args.seed} has no actual Unknown sample')
+            return
         raise ValueError(
             f'fold {args.attack}/seed {args.seed} produced no actual Unknown sample')
 

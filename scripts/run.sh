@@ -144,7 +144,7 @@ step_preprocess() {
           --test-npz  "$TEST_NPZ" \
           --out       "$MANIFEST" \
           --val-ratio 0.10 \
-          --guard-gap-packets 64 \
+          --guard-gap-packets 128 \
           --seed 42
     fi
 
@@ -203,14 +203,19 @@ step_loao() {
 # ── 시각화 ──────────────────────────────────────────────────────────────────
 
 step_visualize() {
+    local SMOKE="${1:-}"
     _step "시각화 — LOAO bar chart"
     "$PY" scripts/plot_loao_bar.py
     _check_file "$OUTPUT_DIR/figures/loao_bar_chart.png"
 
     if [ "$(_use_cae)" = "true" ]; then
         _step "시각화 — Unknown case 4-panel"
-        "$PY" scripts/plot_unknown_case.py
-        _check_file "$OUTPUT_DIR/figures/unknown_case_4panel.png"
+        if [ -n "$SMOKE" ]; then
+            "$PY" scripts/plot_unknown_case.py --allow-missing
+        else
+            "$PY" scripts/plot_unknown_case.py
+            _check_file "$OUTPUT_DIR/figures/unknown_case_4panel.png"
+        fi
     else
         _warn "experiment.use_cae=false: CAE Unknown 사례 그림을 건너뜀"
     fi
@@ -318,7 +323,7 @@ case "$CMD" in
             _check_training_artifacts
         fi
         step_loao ""
-        step_visualize
+        step_visualize ""
         step_test
         _print_summary
         ;;
@@ -335,11 +340,11 @@ case "$CMD" in
     loao)
         _check_training_artifacts
         step_loao ""
-        step_visualize
+        step_visualize ""
         ;;
 
     visualize)
-        step_visualize
+        step_visualize ""
         ;;
 
     smoke)
@@ -357,7 +362,7 @@ case "$CMD" in
         step_preprocess "smoke"
         step_train "smoke"
         step_loao "smoke"
-        step_visualize
+        step_visualize "smoke"
         step_test
         _print_summary
         ;;

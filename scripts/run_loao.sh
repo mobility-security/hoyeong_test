@@ -70,7 +70,11 @@ echo "[3/4] Plotting LOAO bar chart..."
 echo ""
 if [ "$USE_CAE" = "true" ]; then
     echo "[4/4] Plotting unknown case 4-panel..."
-    "$PYTHON" scripts/plot_unknown_case.py
+    if [ -n "$SMOKE" ]; then
+        "$PYTHON" scripts/plot_unknown_case.py --allow-missing
+    else
+        "$PYTHON" scripts/plot_unknown_case.py
+    fi
 else
     echo "[4/4] CAE disabled; skipping reconstruction figure."
 fi

@@ -31,9 +31,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.models.cae import CAE
 from src.models.dcnn import DCNN
+from src.pipeline.two_stage import _effective_anomalous
 from src.train.common import (
-    EarlyStopping, checkpoint_provenance, load_manifest, make_supervised_loader,
-    select_device, validate_artifact_provenance, validate_checkpoint_provenance,
+    EarlyStopping, checkpoint_provenance, config_sha256, load_manifest,
+    make_supervised_loader,
+    result_bundle_provenance, select_device, validate_artifact_provenance,
+    validate_checkpoint_provenance,
 )
 from src.train.train_cae import compute_mse_batch
 from src.utils.config import load_experiment_config, resolve_conf_threshold
@@ -69,30 +72,29 @@ def load_cae(
     ckpt_path: str | Path,
     device: torch.device,
     manifest: dict,
-) -> tuple[CAE, float]:
-    """Load CAE checkpoint and tau from tau_values.json in results/tables/."""
+) -> CAE:
+    """Load CAE checkpoint. Tau is computed per-fold from val-Normal MSE."""
     ckpt_path = Path(ckpt_path)
     ck = torch.load(ckpt_path, map_location=device, weights_only=True)
     validate_checkpoint_provenance(ck, manifest, 'configs/cae.yaml')
     for key in ('model_state_dict', 'input_shape', 'latent_dim'):
         if key not in ck:
             raise ValueError(f'CAE checkpoint missing key: {key}')
+    for key in ('noise_std', 'use_detail_channels', 'cae_input_size'):
+        if key not in ck:
+            raise ValueError(
+                f'CAE checkpoint missing key "{key}"; '
+                'retrain with train_cae.py to generate a complete checkpoint')
     cae = CAE(
         input_shape=tuple(ck['input_shape']),
         latent_dim=int(ck['latent_dim']),
-        noise_std=float(ck.get('noise_std', 0.05)),
-        cae_input_size=int(ck.get('cae_input_size', 32)),
-        use_detail_channels=bool(ck.get('use_detail_channels', False)),
+        noise_std=float(ck['noise_std']),
+        cae_input_size=int(ck['cae_input_size']),
+        use_detail_channels=bool(ck['use_detail_channels']),
     )
     cae.load_state_dict(ck['model_state_dict'])
     cae.eval().to(device)
-
-    tau_path = ckpt_path.parents[1] / 'tables' / 'tau_values.json'
-    with tau_path.open(encoding='utf-8') as fh:
-        tau_data = json.load(fh)
-    validate_artifact_provenance(tau_data, manifest, 'tau artifact')
-    tau = float(tau_data[tau_data.get('headline_tau', 'tau_2sigma')])
-    return cae, tau
+    return cae
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +211,7 @@ def _predict_loao(
     batch_size: int = 64,
     use_cae: bool = True,
     mse: np.ndarray | None = None,
+    routing_mode: str = 'strict_cascade',
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run LOAO pipeline on X.
 
@@ -232,15 +235,24 @@ def _predict_loao(
     n = len(X)
     if n == 0:
         return mse, np.empty(0, dtype=np.int64)
+    strict_gate = use_cae and routing_mode == 'strict_cascade'
+    candidate_mask = cae_anomalous if strict_gate else np.ones(n, dtype=bool)
+    candidate_idx = np.flatnonzero(candidate_mask)
+    preds = np.zeros(n, dtype=np.int64)
+    max_probs = np.full(n, np.nan, dtype=np.float32)
     probability_parts = []
     with torch.no_grad():
-        for start in range(0, len(X), batch_size):
-            logits = s2_model(torch.from_numpy(X[start:start + batch_size]).to(device))
+        for start in range(0, len(candidate_idx), batch_size):
+            batch_idx = candidate_idx[start:start + batch_size]
+            logits = s2_model(torch.from_numpy(X[batch_idx]).to(device))
             probability_parts.append(F.softmax(logits, dim=1).cpu().numpy())
-    probs = np.concatenate(probability_parts) if probability_parts else np.empty((0, 5))
-    max_probs = probs.max(axis=1)
-    preds = probs.argmax(axis=1).astype(np.int64)
-    routed_mask = cae_anomalous | (preds != 0)
+    if probability_parts:
+        probs = np.concatenate(probability_parts)
+        preds[candidate_idx] = probs.argmax(axis=1).astype(np.int64)
+        max_probs[candidate_idx] = probs.max(axis=1)
+    routed_mask = _effective_anomalous(
+        cae_anomalous, preds,
+        's2_recovery' if not use_cae else routing_mode)
     y_pred = np.zeros(n, dtype=np.int64)
     y_pred[routed_mask] = preds[routed_mask]
     y_pred[routed_mask & (max_probs < conf_thr)] = UNKNOWN_LABEL
@@ -254,16 +266,40 @@ def _calibrate_known_confidence(
     y_val: np.ndarray,
     device: torch.device,
     target_reject_rate: float,
-) -> float:
-    """Calibrate confidence on correctly classified known validation samples."""
+    max_threshold: float = 0.95,
+) -> tuple[float, dict]:
+    """Calibrate confidence using every known validation sample."""
     loader = make_supervised_loader(X_val, y_val, batch_size=128)
     y_true, y_pred, probs = _infer_5class(model, loader, device)
-    correct_conf = probs.max(axis=1)[y_true == y_pred]
-    if len(correct_conf) == 0:
-        raise ValueError('cannot calibrate confidence without a correct validation prediction')
     if not 0.0 <= target_reject_rate < 1.0:
         raise ValueError('target_reject_rate must be in [0, 1)')
-    return float(np.quantile(correct_conf, target_reject_rate))
+    if not 0.0 <= max_threshold < 1.0:
+        raise ValueError('max_threshold must be in [0, 1)')
+    present = sorted(np.unique(y_true).tolist())
+    expected = list(range(probs.shape[1]))
+    if present != expected:
+        raise ValueError(
+            f'known validation must cover every fold class: present={present}, expected={expected}')
+    max_conf = probs.max(axis=1)
+    candidates = np.unique(np.concatenate(([0.0, max_threshold], max_conf[max_conf <= max_threshold])))
+    valid = [float(value) for value in candidates
+             if float((max_conf < value).mean()) <= target_reject_rate]
+    threshold = max(valid) if valid else 0.0
+    rejected = max_conf < threshold
+    per_class_reject = {
+        str(label): float(rejected[y_true == label].mean())
+        for label in expected
+    }
+    diagnostics = {
+        'actual_known_reject_rate': float(rejected.mean()),
+        'validation_coverage': float((~rejected).mean()),
+        'validation_accuracy': float(accuracy_score(y_true, y_pred)),
+        'validation_macro_f1': float(f1_score(
+            y_true, y_pred, labels=expected, average='macro', zero_division=0)),
+        'per_class_reject_rate': per_class_reject,
+        'n_validation': int(len(y_true)),
+    }
+    return threshold, diagnostics
 
 
 def run_one_fold(
@@ -287,6 +323,8 @@ def run_one_fold(
     out_dir: str | Path = 'results',
     manifest: dict | None = None,
     mse_test: np.ndarray | None = None,
+    routing_mode: str = 'strict_cascade',
+    max_conf_thr: float = 0.95,
 ) -> List[dict]:
     """Train Stage-2 per seed (excluded class removed), evaluate on test."""
     excl_id = LABEL_MAP[excluded_attack]
@@ -339,13 +377,43 @@ def run_one_fold(
             excluded_attack=excluded_attack,
         )
         seed_conf_thr = conf_thr
+        calibration = {
+            'actual_known_reject_rate': None,
+            'validation_coverage': None,
+            'validation_accuracy': None,
+            'validation_macro_f1': None,
+            'per_class_reject_rate': {},
+            'n_validation': int(len(y_val_5)),
+        }
         if conf_thr_mode == 'validation':
             try:
-                seed_conf_thr = _calibrate_known_confidence(
-                    s2, X_val_5, y_val_5, device, target_known_reject_rate)
+                seed_conf_thr, calibration = _calibrate_known_confidence(
+                    s2, X_val_5, y_val_5, device, target_known_reject_rate,
+                    max_threshold=max_conf_thr)
             except ValueError as exc:
                 print(f'    [WARN] confidence calibration fallback: {exc}')
-        elif conf_thr_mode != 'fixed':
+        elif conf_thr_mode == 'fixed':
+            validation_loader = make_supervised_loader(
+                X_val_5, y_val_5, batch_size=128)
+            y_cal_true, y_cal_pred, cal_probs = _infer_5class(
+                s2, validation_loader, device)
+            max_conf = cal_probs.max(axis=1)
+            rejected = max_conf < seed_conf_thr
+            calibration = {
+                'actual_known_reject_rate': float(rejected.mean()),
+                'validation_coverage': float((~rejected).mean()),
+                'validation_accuracy': float(
+                    accuracy_score(y_cal_true, y_cal_pred)),
+                'validation_macro_f1': float(f1_score(
+                    y_cal_true, y_cal_pred, labels=list(range(5)),
+                    average='macro', zero_division=0)),
+                'per_class_reject_rate': {
+                    str(label): float(rejected[y_cal_true == label].mean())
+                    for label in range(5)
+                },
+                'n_validation': int(len(y_cal_true)),
+            }
+        else:
             raise ValueError(f'unsupported loao_conf_thr_mode: {conf_thr_mode}')
         threshold_path = (
             Path(out_dir) / 'tables' / 'loao_thresholds'
@@ -357,27 +425,37 @@ def run_one_fold(
             'conf_thr': seed_conf_thr,
             'mode': conf_thr_mode,
             'target_known_reject_rate': target_known_reject_rate,
+            'max_conf_thr': max_conf_thr,
+            'routing_mode': routing_mode,
+            **calibration,
             'manifest_sha256': (manifest or {}).get('sha256'),
             'train_sha256': (manifest or {}).get('train_sha256'),
             'test_sha256': (manifest or {}).get('test_sha256'),
+            'config_sha256': config_sha256(
+                'configs/model.yaml', 'configs/train.yaml',
+                'configs/cae.yaml', 'configs/experiment.yaml'),
         }, indent=2), encoding='utf-8')
 
         _, y_pred_eval = _predict_loao(
             cae, s2, X_eval, tau, seed_conf_thr, device,
-            use_cae=use_cae, mse=mse_eval)
+            use_cae=use_cae, mse=mse_eval, routing_mode=routing_mode)
 
         # Also compute on ALL test attacks of the excluded class (not just those in eval)
         _, y_pred_excl = _predict_loao(
             cae, s2, X_test[excl_test_mask], tau, seed_conf_thr, device,
-            use_cae=use_cae, mse=mse_excl)
+            use_cae=use_cae, mse=mse_excl, routing_mode=routing_mode)
         _, y_pred_known = _predict_loao(
             cae, s2, X_test[known_test_mask], tau, seed_conf_thr, device,
-            use_cae=use_cae, mse=mse_known)
+            use_cae=use_cae, mse=mse_known, routing_mode=routing_mode)
 
         cae_recall_only = (
             float((mse_excl > tau).mean())
             if use_cae and len(mse_excl) else float('nan'))
         unknown_rate_only = float((y_pred_excl == UNKNOWN_LABEL).mean()) if len(y_pred_excl) else float('nan')
+        if (use_cae and routing_mode == 'strict_cascade'
+                and np.isfinite(unknown_rate_only)
+                and unknown_rate_only > cae_recall_only + 1e-12):
+            raise ValueError('strict LOAO Unknown rate cannot exceed CAE anomaly recall')
         cae_normal_fpr = (
             float((mse_normal > tau).mean())
             if use_cae and len(mse_normal) else float('nan'))
@@ -394,11 +472,14 @@ def run_one_fold(
             'cae_anomaly_recall': cae_recall_only,
             'unknown_rate': unknown_rate_only,
             'normal_fpr': normal_fpr,
+            'pipeline_normal_fpr': normal_fpr,
             'cae_normal_fpr': cae_normal_fpr,
             'mse_roc_auc': mse_auc,
             'known_accuracy': known_accuracy,
             'known_macro_f1': known_macro_f1,
             'conf_thr': seed_conf_thr,
+            'known_reject_rate': calibration['actual_known_reject_rate'],
+            'routing_mode': routing_mode,
             'checkpoint_path': str(checkpoint_path),
             'threshold_path': str(threshold_path),
             'manifest_sha256': (manifest or {}).get('sha256'),
@@ -448,6 +529,8 @@ def run_loao(
         target_known_reject_rate=float(config.get('target_known_reject_rate', 0.05)),
         out_dir=config.get('out_dir', 'results'),
         mse_test=config.get('mse_test'),
+        routing_mode=str(config.get('routing_mode', 'strict_cascade')),
+        max_conf_thr=float(config.get('max_conf_thr', 0.95)),
     )
     return {'seed_results': rows, **{
         key: float(pd.DataFrame(rows)[key].mean())
@@ -481,6 +564,7 @@ def main() -> None:
         train_npz_path=cfg_exp.train_npz_path,
         test_npz_path=cfg_exp.test_npz_path)
     conf_thr_mode = str(cfg_exp.get('loao_conf_thr_mode', 'fixed'))
+    routing_mode = str(cfg_exp.get('routing_mode', 'strict_cascade'))
     conf_thr = resolve_conf_threshold(cfg_exp, manifest)
     use_cae = bool(cfg_exp.get('use_cae', True))
 
@@ -500,7 +584,17 @@ def main() -> None:
     tau = float('nan')
     if use_cae:
         print(f'Loading CAE from {cae_ckpt}')
-        cae, tau = load_cae(cae_ckpt, device, manifest)
+        cae = load_cae(cae_ckpt, device, manifest)
+        # M4: fold-specific tau — derive from current val-Normal MSE, not cached JSON
+        normal_val_mask = y_vl == 0
+        if not normal_val_mask.any():
+            raise ValueError('val split contains no Normal samples; cannot calibrate tau')
+        mse_normal_val = compute_mse_batch(cae, X_vl[normal_val_mask], device)
+        mu = float(mse_normal_val.mean())
+        sigma = float(mse_normal_val.std(ddof=1)) if len(mse_normal_val) > 1 else 0.0
+        tau = mu + 2 * sigma
+        print(f'tau recalibrated from val-Normal (N={normal_val_mask.sum()}): '
+              f'mu={mu:.6f}  sigma={sigma:.6f}  tau={tau:.6f}')
         mse_test = compute_mse_batch(cae, X_test, device)
     else:
         print('CAE disabled by experiment.use_cae; running confidence-only open-set mode')
@@ -537,6 +631,8 @@ def main() -> None:
             out_dir=out_dir,
             manifest=manifest,
             mse_test=mse_test,
+            routing_mode=routing_mode,
+            max_conf_thr=float(cfg_exp.get('loao_max_conf_thr', 0.95)),
         )
         all_rows.extend(rows)
 
@@ -550,7 +646,10 @@ def main() -> None:
     print(f'\nSaved: {per_fold_path}')
 
     # --- Summary: 5-fold mean±std ---
-    metric_cols = ['unknown_rate', 'normal_fpr', 'known_accuracy', 'known_macro_f1']
+    metric_cols = [
+        'unknown_rate', 'normal_fpr', 'cae_normal_fpr',
+        'known_accuracy', 'known_macro_f1', 'known_reject_rate',
+    ]
     agg = df.groupby('excluded_attack')[metric_cols].agg(['mean', 'std']).reset_index()
     agg.columns = ['excluded_attack'] + [f'{m}_{s}' for m, s in agg.columns[1:]]
     agg = agg.fillna(0.0)
@@ -578,6 +677,12 @@ def main() -> None:
             'normal_fpr_mean': row['normal_fpr_mean'],
             'normal_fpr_std': row['normal_fpr_std'],
             'normal_fpr_ci95': 1.96 * row['normal_fpr_std'] / np.sqrt(len(seeds)),
+            'cae_normal_fpr_mean': row['cae_normal_fpr_mean'],
+            'cae_normal_fpr_std': row['cae_normal_fpr_std'],
+            'cae_normal_fpr_ci95': 1.96 * row['cae_normal_fpr_std'] / np.sqrt(len(seeds)),
+            'known_reject_rate_mean': row['known_reject_rate_mean'],
+            'known_reject_rate_std': row['known_reject_rate_std'],
+            'known_reject_rate_ci95': 1.96 * row['known_reject_rate_std'] / np.sqrt(len(seeds)),
             'known_accuracy_mean': row['known_accuracy_mean'],
             'known_accuracy_std': row['known_accuracy_std'],
             'known_accuracy_ci95': 1.96 * row['known_accuracy_std'] / np.sqrt(len(seeds)),
@@ -595,6 +700,12 @@ def main() -> None:
         'normal_fpr_mean': grand['normal_fpr'],
         'normal_fpr_std': grand_std['normal_fpr'],
         'normal_fpr_ci95': 1.96 * grand_std['normal_fpr'] / np.sqrt(max(len(fold_means), 1)),
+        'cae_normal_fpr_mean': grand['cae_normal_fpr'],
+        'cae_normal_fpr_std': grand_std['cae_normal_fpr'],
+        'cae_normal_fpr_ci95': 1.96 * grand_std['cae_normal_fpr'] / np.sqrt(max(len(fold_means), 1)),
+        'known_reject_rate_mean': grand['known_reject_rate'],
+        'known_reject_rate_std': grand_std['known_reject_rate'],
+        'known_reject_rate_ci95': 1.96 * grand_std['known_reject_rate'] / np.sqrt(max(len(fold_means), 1)),
         'known_accuracy_mean': grand['known_accuracy'],
         'known_accuracy_std': grand_std['known_accuracy'],
         'known_accuracy_ci95': 1.96 * grand_std['known_accuracy'] / np.sqrt(max(len(fold_means), 1)),
@@ -605,7 +716,42 @@ def main() -> None:
     df_summary = pd.DataFrame(summary_rows)
     summary_path = os.path.join(out_tables, 'loao_summary.csv')
     df_summary.to_csv(summary_path, index=False)
+
+    # M7: per-seed raw metrics (Recall 포함) CSV — 통계 보고 투명성
+    from src.utils.io import LABEL_NAMES as _LABEL_NAMES, LABEL_MAP as _LABEL_MAP
+    raw_rows = []
+    for row in all_rows:
+        excl = row['excluded_attack']
+        excl_id = _LABEL_MAP.get(excl, -1)
+        raw_row = {
+            'excluded_attack': excl,
+            'seed': row['seed'],
+            'unknown_rate': row['unknown_rate'],
+            'cae_anomaly_recall': row.get('cae_anomaly_recall', float('nan')),
+            'normal_fpr': row.get('normal_fpr', float('nan')),
+            'known_accuracy': row.get('known_accuracy', float('nan')),
+            'known_macro_f1': row.get('known_macro_f1', float('nan')),
+            'conf_thr': row.get('conf_thr', float('nan')),
+        }
+        raw_rows.append(raw_row)
+    df_raw = pd.DataFrame(raw_rows)
+    raw_path = os.path.join(out_tables, 'loao_per_seed_raw.csv')
+    df_raw.to_csv(raw_path, index=False)
+    print(f'Saved: {raw_path}')
+
+    provenance_path = os.path.join(out_tables, 'loao.provenance.json')
+    Path(provenance_path).write_text(json.dumps(result_bundle_provenance(
+        manifest,
+        {'per_fold': per_fold_path, 'summary': summary_path},
+        'configs/model.yaml', 'configs/train.yaml', 'configs/cae.yaml',
+        'configs/experiment.yaml',
+        routing_mode=routing_mode,
+        use_cae=use_cae,
+        folds=folds,
+        seeds=seeds,
+    ), indent=2), encoding='utf-8')
     print(f'Saved: {summary_path}')
+    print(f'Saved: {provenance_path}')
     print(df_summary.to_string(index=False))
 
 

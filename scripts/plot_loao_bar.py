@@ -30,9 +30,12 @@ ATTACK_LABELS = {
 
 def main() -> None:
     from src.utils.config import load_experiment_config
+    from src.train.common import load_manifest, validate_result_bundle
+    from src.utils.io import load_dataset
     cfg_exp = load_experiment_config()
     output_dir = Path(str(cfg_exp.output_dir))
     summary_path = output_dir / 'tables' / 'loao_summary.csv'
+    per_fold_path = output_dir / 'tables' / 'loao_per_fold.csv'
     figure_path = output_dir / 'figures' / 'loao_bar_chart.png'
     if not summary_path.exists():
         print(f'[WARN] {summary_path} not found — generating from per-fold CSV.')
@@ -56,6 +59,19 @@ def main() -> None:
             })
         df = pd.DataFrame(summary_rows)
     else:
+        X_train, _, _ = load_dataset(cfg_exp.train_npz_path)
+        X_test, _, _ = load_dataset(cfg_exp.test_npz_path)
+        manifest = load_manifest(
+            cfg_exp.manifest_path, len(X_train), len(X_test),
+            train_npz_path=cfg_exp.train_npz_path,
+            test_npz_path=cfg_exp.test_npz_path)
+        provenance_path = output_dir / 'tables' / 'loao.provenance.json'
+        provenance = __import__('json').loads(provenance_path.read_text(encoding='utf-8'))
+        validate_result_bundle(
+            provenance, manifest,
+            {'per_fold': per_fold_path, 'summary': summary_path},
+            'configs/model.yaml', 'configs/train.yaml', 'configs/cae.yaml',
+            'configs/experiment.yaml')
         full_summary = pd.read_csv(summary_path)
         grand_row = full_summary[full_summary['excluded_attack'] == 'grand_mean']
         df = full_summary[full_summary['excluded_attack'] != 'grand_mean'].copy()
@@ -95,7 +111,6 @@ def main() -> None:
 
     ax.set_xlabel('Excluded Attack Class', fontsize=12)
     ax.set_ylabel('Detection Rate', fontsize=12)
-    per_fold_path = output_dir / 'tables' / 'loao_per_fold.csv'
     raw = pd.read_csv(per_fold_path) if per_fold_path.exists() else None
     n_folds = int(raw['excluded_attack'].nunique()) if raw is not None else len(df)
     n_seeds = int(raw.groupby('excluded_attack')['seed'].nunique().max()) if raw is not None else 0

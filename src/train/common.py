@@ -15,6 +15,7 @@ from src.utils.split import (
     validate_manifest_provenance,
     validate_trainval_indices,
 )
+from src.utils.io import sha256_file
 
 
 class EarlyStopping:
@@ -173,3 +174,44 @@ def validate_artifact_provenance(
                 or artifact[artifact_key] != manifest.get(manifest_key)):
             raise ValueError(
                 f'{artifact_name} {artifact_key} does not match the active manifest')
+
+
+def result_bundle_provenance(
+    manifest: dict,
+    artifacts: dict[str, str | Path],
+    *config_paths: str | Path,
+    **extra,
+) -> dict:
+    """Build provenance for result tables/figures derived from checkpoints."""
+    payload = {
+        'schema_version': 2,
+        'manifest_sha256': manifest['sha256'],
+        'train_sha256': manifest['train_sha256'],
+        'test_sha256': manifest['test_sha256'],
+        'config_sha256': config_sha256(*config_paths),
+        'artifacts': {
+            name: {'path': str(path), 'sha256': sha256_file(path)}
+            for name, path in artifacts.items()
+        },
+    }
+    payload.update(extra)
+    return payload
+
+
+def validate_result_bundle(
+    provenance: dict,
+    manifest: dict,
+    artifacts: dict[str, str | Path],
+    *config_paths: str | Path,
+) -> None:
+    """Reject stale or modified result files before downstream reporting."""
+    validate_artifact_provenance(provenance, manifest, 'result bundle')
+    if provenance.get('config_sha256') != config_sha256(*config_paths):
+        raise ValueError('result bundle config_sha256 does not match active configs')
+    recorded = provenance.get('artifacts')
+    if not isinstance(recorded, dict):
+        raise ValueError('result bundle is missing artifact hashes')
+    for name, path in artifacts.items():
+        entry = recorded.get(name)
+        if not isinstance(entry, dict) or entry.get('sha256') != sha256_file(path):
+            raise ValueError(f'result artifact does not match provenance: {name}')

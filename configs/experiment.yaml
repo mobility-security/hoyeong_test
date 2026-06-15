@@ -3,11 +3,13 @@ experiment:
   test_npz_path:  data/processed/dataset_test.npz    # 논문 원본 frozen test (절대 학습에 사용 금지)
   manifest_path:  data/processed/split_manifest.json
   use_cae: true        # true → Stage 1 CAE 게이트 활성화 / false → S2 단독 모드
+  routing_mode: s2_recovery  # strict_cascade | s2_recovery
   conf_thr: 0.5
   conf_thr_source: fixed   # fixed | artifact
   conf_thr_artifact: results/tables/conf_threshold.json
   loao_conf_thr_mode: validation   # fixed | validation
-  target_known_reject_rate: 0.15
+  target_known_reject_rate: 0.05
+  loao_max_conf_thr: 0.95
   benchmark_batch_size: 64
   benchmark_warmup: 2
   benchmark_repeats: 5
