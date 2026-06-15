@@ -1,13 +1,19 @@
-"""전처리 오케스트레이터 (Team A / 김민세) — PCAP 매니페스트 → dataset.npz v1.
+"""[DEPRECATED] 레거시 전처리 오케스트레이터 — 사용 금지.
 
-매니페스트 CSV 컬럼: pcap_path, label_name   (label_name ∈ io.LABEL_MAP 키)
-캡처는 시나리오별이라 한 pcap 의 모든 패킷에 그 pcap 의 라벨을 부여한다.
-group_id = pcap 인덱스 → 누수 안전 split 의 atomic 단위.
+이 스크립트는 pcap당 단일 라벨을 부여하는 v1 방식으로, 현재는 패킷별
+라벨링을 사용하는 scripts/build_tow_dataset.py 로 교체되었습니다.
 
-사용:
-    python -m src.preprocessing.build_dataset \
-        --manifest data/raw/manifest.csv --out data/processed/dataset.npz
+현재 실험에서 사용하는 빌더:
+    scripts/build_tow_dataset.py   ← 이것을 사용하세요
+
+이 파일은 하위 호환성 보존을 위해 남겨두었으나 실행하면 RuntimeError가 발생합니다.
 """
+import sys
+raise RuntimeError(
+    'src/preprocessing/build_dataset.py is deprecated. '
+    'Use scripts/build_tow_dataset.py instead.'
+)
+# fmt: off  # noqa: E402  (dead code below kept for reference only)
 from __future__ import annotations
 
 import argparse

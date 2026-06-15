@@ -73,7 +73,9 @@ def main() -> None:
         return
     cae, tau = _load_cae(output_dir, device, manifest)
     conf_thr = resolve_conf_threshold(cfg, manifest)
-    pipeline = TwoStagePipeline(cae, s2, tau, conf_thr, use_cae=True)
+    pipeline = TwoStagePipeline(
+        cae, s2, tau, conf_thr, use_cae=True,
+        routing_mode=str(cfg.get('routing_mode', 'strict_cascade')))
     y_pred_s3 = _predict_two_stage(pipeline, X_test, device, batch_size)
     cm_s3 = confusion_matrix(
         y_test, y_pred_s3, labels=list(range(NUM_CLASSES + 1)))

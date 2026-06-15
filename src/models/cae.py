@@ -111,6 +111,9 @@ class CAE(nn.Module):
         C_enc, H_enc, W_enc = self._shape_enc
         z = self.enc_fc(self.encoder(x_in).flatten(1))
         xhat_small = self.decoder(self.dec_fc(z).view(-1, C_enc, H_enc, W_enc))
+        if xhat_small.shape[2:] != x_ll.shape[2:]:
+            xhat_small = F.interpolate(
+                xhat_small, size=x_ll.shape[2:], mode='bilinear', align_corners=False)
         return ((xhat_small - x_ll) ** 2).mean(dim=(1, 2, 3))
 
     def n_params(self) -> int:

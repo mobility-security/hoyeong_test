@@ -20,7 +20,7 @@ from src.models.dcnn import DCNN
 from src.pipeline.two_stage import TwoStagePipeline
 from src.train.common import (
     load_manifest, select_device, validate_artifact_provenance,
-    validate_checkpoint_provenance,
+    validate_checkpoint_provenance, validate_result_bundle,
 )
 from src.train.train_s1 import binarize
 from src.utils.benchmark import benchmark_predict
@@ -134,10 +134,17 @@ def _load_cae(
         output_dir / 'checkpoints' / 'cae_best.pth',
         map_location=device, weights_only=True)
     validate_checkpoint_provenance(checkpoint, manifest, 'configs/cae.yaml')
+    for key in ('noise_std', 'use_detail_channels', 'cae_input_size'):
+        if key not in checkpoint:
+            raise ValueError(
+                f'CAE checkpoint missing key "{key}"; '
+                'retrain with train_cae.py to generate a complete checkpoint')
     cae = CAE(
         input_shape=tuple(checkpoint['input_shape']),
         latent_dim=int(checkpoint['latent_dim']),
-        noise_std=float(checkpoint.get('noise_std', 0.05)),
+        noise_std=float(checkpoint['noise_std']),
+        cae_input_size=int(checkpoint['cae_input_size']),
+        use_detail_channels=bool(checkpoint['use_detail_channels']),
     ).to(device)
     cae.load_state_dict(checkpoint['model_state_dict'])
     cae.eval()
@@ -205,6 +212,18 @@ def main() -> None:
     loao_unknown_rate = float('nan')
     loao_path = output_dir / 'tables' / 'loao_summary.csv'
     if loao_path.exists():
+        provenance_path = output_dir / 'tables' / 'loao.provenance.json'
+        if not provenance_path.exists():
+            raise ValueError('LOAO provenance is missing; rerun the LOAO experiment')
+        loao_provenance = json.loads(provenance_path.read_text(encoding='utf-8'))
+        validate_result_bundle(
+            loao_provenance, manifest,
+            {
+                'per_fold': output_dir / 'tables' / 'loao_per_fold.csv',
+                'summary': loao_path,
+            },
+            'configs/model.yaml', 'configs/train.yaml', 'configs/cae.yaml',
+            'configs/experiment.yaml')
         loao = pd.read_csv(loao_path)
         grand = loao[loao['excluded_attack'] == 'grand_mean']
         if len(grand):
@@ -253,7 +272,9 @@ def main() -> None:
                 model = _load_dcnn(
                     output_dir / 'checkpoints' / f's2_seed_{seed}_best.pth',
                     NUM_CLASSES, device, manifest)
-                pipeline = TwoStagePipeline(cae, model, tau, conf_thr, use_cae=True)
+                pipeline = TwoStagePipeline(
+                    cae, model, tau, conf_thr, use_cae=True,
+                    routing_mode=str(cfg_exp.get('routing_mode', 'strict_cascade')))
                 predict = lambda: _predict_two_stage(
                     pipeline, X_test, device, batch_size)
                 y_pred, timing = benchmark_predict(

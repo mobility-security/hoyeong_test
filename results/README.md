@@ -11,6 +11,8 @@
 
 checkpoint와 threshold에는 manifest/data/config 해시가 포함되며, 불일치하면 로더가
 실행을 중단합니다. 비교표에는 별도 `comparison_table.provenance.json`도 생성됩니다.
+LOAO 표는 `loao.provenance.json`이 CSV 두 개의 해시까지 검증하며, 이전
+manifest의 결과가 남아 있으면 비교표와 시각화 생성이 중단됩니다.
 
 ```bash
 bash scripts/run.sh train

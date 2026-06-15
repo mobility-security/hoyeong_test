@@ -7,7 +7,9 @@
 `leave_one_out.py`는 공격 클래스 하나를 학습에서 제외한 뒤 해당 클래스를 미지 공격으로
 평가하는 LOAO 실험입니다. 각 fold/seed의 5-class checkpoint를 보존하고 MSE ROC-AUC,
 Unknown rate, known macro-F1, Normal FPR을 기록합니다. confidence threshold는 known
-validation confidence로 보정할 수 있습니다.
+validation 전체 confidence로 보정하며 클래스 커버리지를 강제합니다. strict
+cascade에서 headline Unknown rate는 `MSE > tau AND Unknown`으로 계산되므로
+CAE anomaly recall보다 클 수 없습니다.
 
 ```bash
 python -m experiments.leave_one_out
@@ -16,3 +18,5 @@ python -m experiments.leave_one_out --smoke
 
 `experiment.use_cae=true`일 때는 provenance가 일치하는 CAE checkpoint가 필요합니다.
 `false`이면 CAE 없이 confidence-only fallback으로 실행됩니다.
+`loao.provenance.json`은 per-fold/summary CSV, dataset, manifest, config hash를
+묶으며 비교표과 시각화 스크립트가 사용 전 검증합니다.
